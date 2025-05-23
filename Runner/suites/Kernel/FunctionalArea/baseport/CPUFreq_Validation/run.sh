@@ -3,27 +3,9 @@
 # Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
-# Resolve the directory containing this script
-# shellcheck disable=SC2037
-SCRIPT_DIR=$(CDPATH=cd -- "$(dirname "$0")" >/dev/null 2>&1 && pwd)
-
-# Traverse upward to find Runner root containing utils/
-RUNNER_DIR="$SCRIPT_DIR"
-while [ ! -d "$RUNNER_DIR/utils" ] && [ "$RUNNER_DIR" != "/" ]; do
-  RUNNER_DIR=$(dirname "$RUNNER_DIR")
-done
-
-FUNCLIB="$RUNNER_DIR/utils/functestlib.sh"
-
-if [ ! -f "$FUNCLIB" ]; then
-  echo "Error: Could not locate functestlib.sh from $SCRIPT_DIR" >&2
-  exit 1
-fi
-
-# shellcheck disable=SC1090
-. "$FUNCLIB"
-
+. "${PWD}/init_env"
 TESTNAME="CPUFreq_Validation"
+. "$TOOLS/functestlib.sh"
 
 test_path=$(find_test_case_by_name "$TESTNAME")
 log_info "-----------------------------------------------------------------------------------------"
@@ -93,7 +75,7 @@ validate_cpu_core() {
     done
 
     echo "Restoring $cpu governor to 'ondemand'..."
-    echo "ondemand" | tee "$cpu/cpufreq/scaling_governor" > /dev/null
+    echo "ondemand" | sudo tee "$cpu/cpufreq/scaling_governor" > /dev/null
 }
 
 cpu_index=0

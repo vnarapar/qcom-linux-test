@@ -4,11 +4,12 @@
 # SPDX-License-Identifier: BSD-3-Clause-Clear
 
 # Import test suite definitions
-. "${PWD}"/init_env
+SCRIPT_DIR="$(cd -- "$(dirname "$0")" >/dev/null 2>&1 && pwd)" 
+. "$SCRIPT_DIR/../../../../../init_env" 
+. "$SCRIPT_DIR/../../../../../utils/functestlib.sh"
 TESTNAME="adsp_remoteproc"
 
-#import test functions library
-. "${TOOLS}"/functestlib.sh
+
 test_path=$(find_test_case_by_name "$TESTNAME")
 log_info "--------------------------------------------------------------------------"
 log_info "-------------------Starting $TESTNAME Testcase----------------------------"

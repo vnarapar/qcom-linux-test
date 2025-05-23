@@ -1,7 +1,11 @@
 #!/bin/sh
+# Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
 # SPDX-License-Identifier: BSD-3-Clause-Clear
- 
-# Base directory of Runner
-BASE_DIR="$(CDPATH= cd -- "$(dirname "$0")" >/dev/null 2>&1 && pwd)"
-export TOOLS="${BASE_DIR}/utils"
-export __RUNNER_SUITES_DIR="${BASE_DIR}/suites"
+
+# Source this file to setup the test suite environment
+BASEDIR=$(pwd)
+export BASEDIR
+TOOLS=$(pwd)/utils
+export TOOLS
+SUITES=$(pwd)/suites
+export SUITES
