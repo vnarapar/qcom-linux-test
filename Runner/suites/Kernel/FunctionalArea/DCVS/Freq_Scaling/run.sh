@@ -49,15 +49,23 @@ check_kernel_config "$CONFIGS" || {
 CPUFREQ_BASE_PATH="/sys/devices/system/cpu"
 i=0
 
-while [ "$i" -le 7 ]; do
-    CPUFREQ_PATH="$CPUFREQ_BASE_PATH/cpu$i/cpufreq"
-    if [ ! -d "$CPUFREQ_PATH" ]; then
-        log_fail "CPUFreq interface not found for cpu$i"
-        echo "$TESTNAME FAIL" > "$res_file"
-        exit 1
+miss=0
+
+for cpu_dir in /sys/devices/system/cpu/cpu[0-8]*; do
+    CPUFREQ_PATH="$cpu_dir/cpufreq"
+    if [ -d "$CPUFREQ_PATH" ]; then
+        cpu_name="${cpu_dir##*/}"
+        log_pass "$cpu_name has cpufreq interface"
+    else
+        miss=1
     fi
-    i=`expr "$i" + 1`
 done
+
+if [ "$miss" -eq 1 ]; then
+    echo "CPUFreq interface not found. Test Failed"
+    echo "$TESTNAME FAIL" > "$res_file"
+    exit 1
+fi
 
 log_info "Reading scaling governor..."
 GOVERNOR=$(cat $CPUFREQ_PATH/scaling_governor)
