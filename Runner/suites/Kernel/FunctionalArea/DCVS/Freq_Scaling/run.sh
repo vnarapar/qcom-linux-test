@@ -77,7 +77,7 @@ MAX_FREQ=$(cat $CPUFREQ_PATH/cpuinfo_max_freq)
 log_info "CPU frequency range: $MIN_FREQ - $MAX_FREQ"
 
 log_info "Triggering frequency update via governor"
-cat /dev/urandom | head -c 1000M > /dev/null &
+dd if=/dev/urandom of=/dev/null bs=1M count=1000 &
 LOAD_PID=$!
 sleep 2
 
