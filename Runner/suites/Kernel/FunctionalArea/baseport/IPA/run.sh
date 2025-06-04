@@ -40,7 +40,7 @@ log_info "-------------------Starting $TESTNAME Testcase------------------------
 log_info "=== Test Initialization ==="
 
 PATH=$(find / -name "ipa.ko" 2>/dev/null)
-
+echo "Path for ipa.ko is $PATH"
 # Check if the file was found
 if [ -z "$PATH" ]; then
   log_error "ipa.ko file not found."
