@@ -20,18 +20,16 @@ run:
         - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/cdsp_remoteproc/cdsp_remoteproc.res || true
         - $PWD/suites/Kernel/FunctionalArea/baseport/IPA/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/IPA/IPA.res || true
-        - $PWD/suites/Kernel/FunctionalArea/baseport/IPCC/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/IPCC/IPCC.res || true
         - $PWD/suites/Kernel/FunctionalArea/baseport/pinctrl/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/pinctrl/pinctrl.res || true
         - $PWD/suites/Kernel/FunctionalArea/baseport/remoteproc/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/remoteproc/remoteproc.res || true
         - $PWD/suites/Kernel/FunctionalArea/baseport/wpss_remoteproc/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/wpss_remoteproc/wpss_remoteproc.res || true
-        - $PWD/suites/Multimedia/Graphics/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Graphics/Graphics.res || true
-        - $PWD/suites/Multimedia/DSP_AudioPD/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/DSP_AudioPD/DSP_AudioPD.res || true
+        - $PWD/suites/Multimedia/Graphics/KMSCube/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Graphics/KMSCube/KMSCube.res || true
+        - $PWD/suites/Multimedia/Graphics/weston-simple-egl/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Graphics/weston-simple-egl/weston-simple-egl.res || true
         - $PWD/suites/Multimedia/Audio/AudioPlayback/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Audio/AudioPlayback/AudioPlayback.res || true
         - $PWD/suites/Multimedia/Audio/AudioRecord/run.sh || true
