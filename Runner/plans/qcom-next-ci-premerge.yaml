@@ -52,4 +52,14 @@ run:
         - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/storage/storage.res || true
         - $PWD/suites/Kernel/FunctionalArea/baseport/wpss_remoteproc/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/wpss_remoteproc/wpss_remoteproc.res || true
+        - $PWD/suites/Kernel/FunctionalArea/DVCS/Freq_Scaling/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/DVCS/Freq_Scaling/Freq_Scaling.res || true
+        - $PWD/suites/Kernel/FunctionalArea/Scheduler/CPU_affinity/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/Scheduler/CPU_affinity/CPU_affinity.res || true
+        - $PWD/suites/Kernel/FunctionalArea/baseport/iommu/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/iommu/iommu.res || true
+        - $PWD/suites/Kernel/FunctionalArea/baseport/Probe_Failure_Check/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/Probe_Failure_Check/Probe_Failure_Check.res || true
+        - $PWD/suites/Kernel/FunctionalArea/baseport/shmbridge/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/FunctionalArea/baseport/shmbridge/shmbridge.res || true
         - $PWD/utils/result_parse.sh
