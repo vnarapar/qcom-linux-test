@@ -83,7 +83,7 @@ if [ "$state5" != "running" ]; then
     echo "$TESTNAME FAIL" > "$res_file" 
     exit 1
 fi
-
+sleep 2
 # If all checks pass, print "PASS"
 echo "adsp PASS"
 log_pass "adsp PASS"
