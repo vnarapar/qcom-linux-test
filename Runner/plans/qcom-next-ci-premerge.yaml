@@ -56,4 +56,18 @@ run:
         - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/DCVS/Freq_Scaling/Freq_Scaling.res || true
         - $PWD/suites/Kernel/Scheduler/CPU_affinity/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Scheduler/CPU_affinity/CPU_affinity.res || true
+        - $PWD/suites/Kernel/Baseport/PCIe/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/PCIe/PCIe.res || true
+        - $PWD/suites/Kernel/Baseport/Timer/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/Timer/Timer.res || true
+        - $PWD/suites/Kernel/Baseport/USBHost/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/USBHost/USBHost.res || true
+        - $PWD/suites/Kernel/Baseport/shmbridge/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/shmbridge/shmbridge.res || true
+        - $PWD/suites/Kernel/Baseport/etm_trace/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/etm_trace/etm_trace.res || true
+        - $PWD/suites/Kernel/Baseport/stm_cpu/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/stm_cpu/stm_cpu.res || true
+        - $PWD/suites/Connectivity/Ethernet/Ethernet/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/Ethernet/Ethernet.res || true
         - $PWD/utils/result_parse.sh
