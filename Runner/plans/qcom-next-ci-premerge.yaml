@@ -64,4 +64,12 @@ run:
         - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/shmbridge/shmbridge.res || true
         - $PWD/suites/Connectivity/Ethernet/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/Ethernet/Ethernet.res || true
+        - $PWD/suites/Connectivity/WiFi/WiFi_Dynamic_IP/run.sh "Mainline_devices" "linuxmainline@123" || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/WiFi/WiFi_Dynamic_IP.res || true
+        - $PWD/suites/Connectivity/WiFi/WiFi_Firmware_Driver/run.sh "Mainline_devices" "linuxmainline@123" || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/WiFi/WiFi_Firmware_Driver.res || true
+        - $PWD/suites/Connectivity/WiFi/WiFi_Manual_IP/run.sh "Mainline_devices" "linuxmainline@123" || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/WiFi/WiFi_Manual_IP.res || true
+        - $PWD/suites/Connectivity/WiFi/WiFi_OnOff/run.sh "Mainline_devices" "linuxmainline@123" || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/WiFi/WiFi_OnOff.res || true
         - $PWD/utils/result_parse.sh
