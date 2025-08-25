@@ -54,8 +54,11 @@ log_info "$initial_votes"
 
 log_info "Running lat_mem_rd tool..."
 $test_bin_path -t 128MB 16 &
+$test_bin_path -t 128MB 16 &
+$test_bin_path -t 128MB 16 &
 
-sleep 30
+
+sleep 20
 log_info "Vote check while bw_mem tool is running:"
 final_votes=$(extract_votes)
 log_info "$final_votes"
