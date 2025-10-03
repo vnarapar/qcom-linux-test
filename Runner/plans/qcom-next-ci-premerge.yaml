@@ -14,6 +14,10 @@ metadata:
 run:
     steps:
         - cd Runner
+        - echo $TARGET
+        - echo $STACK
+        - echo $IRIS_BIN
+        - echo $DOWNSTREAM_FW
         - $PWD/suites/Kernel/Baseport/adsp_remoteproc/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/adsp_remoteproc/adsp_remoteproc.res || true
         - $PWD/suites/Kernel/Baseport/cdsp_remoteproc/run.sh || true
