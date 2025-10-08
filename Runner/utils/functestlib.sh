@@ -1264,6 +1264,19 @@ dt_has_remoteproc_fw() {
     return 1
 }
 
+# Find remoteproc path by firmware substring
+get_remoteproc_path_by_firmware() {
+    name="$1"
+    idx=""
+    path=""
+    idx=$(cat /sys/class/remoteproc/remoteproc*/firmware 2>/dev/null | grep -n "$name" | cut -d: -f1 | head -n1)
+    [ -z "$idx" ] && return 1
+    idx=$((idx - 1))
+    path="/sys/class/remoteproc/remoteproc${idx}"
+    [ -d "$path" ] && echo "$path" && return 0
+    return 1
+}
+
 # Get remoteproc state
 get_remoteproc_state() {
     rp="$1"
