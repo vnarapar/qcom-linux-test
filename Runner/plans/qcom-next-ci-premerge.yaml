@@ -16,4 +16,6 @@ run:
         - cd Runner
         - $PWD/suites/Connectivity/WiFi/WiFi_OnOff/run.sh --ssid Vamsee --password vamsee || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/WiFi/WiFi_OnOff/WiFi_OnOff.res || true
+        - $PWD/suites/Connectivity/WiFi/WiFi_Manual_IP/run.sh --ssid Vamsee --password vamsee || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/WiFi/WiFi_Manual_IP/WiFi_Manual_IP.res || true
         - $PWD/utils/result_parse.sh
