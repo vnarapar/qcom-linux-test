@@ -41,6 +41,12 @@ fi
 # shellcheck disable=SC1091
 . "$TOOLS/lib_video.sh"
 
+if ! setup_overlay_audio_environment; then
+    log_fail "Overlay audio environment setup failed"
+    echo "$TESTNAME FAIL" > "$RES_FILE"
+    exit 1
+fi
+
 TESTNAME="AudioPlayback"
 RES_FILE="./${TESTNAME}.res"
 LOGDIR="results/${TESTNAME}"

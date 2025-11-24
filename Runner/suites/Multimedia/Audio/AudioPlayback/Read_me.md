@@ -28,6 +28,16 @@ Ensure the following components are present in the target Yocto build:
 - Common tools: `pgrep`, `timeout`, `grep`, `wget`, `tar`
 - Daemon: `pipewire` or `pulseaudio` must be running
 
+## Overlay Build Support
+
+For overlay builds using audioreach kernel modules, the test automatically:
+- Detects the overlay build configuration
+- Sets required DMA heap permissions
+- Restarts PipeWire service
+- Waits for the service to be ready
+
+This happens transparently before tests run. No manual configuration needed.
+
 ## Directory Structure
 
 ```bash
