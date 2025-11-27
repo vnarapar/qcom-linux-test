@@ -155,6 +155,80 @@ audio_timeout_run() {
   done
   wait "$pid"; return $?
 }
+
+# Function: setup_overlay_audio_environment
+# Purpose: Configure audio environment for overlay builds (audioreach-based)
+# Returns: 0 on success, 1 on failure
+# Usage: Call early in audio test initialization, before backend detection
+
+setup_overlay_audio_environment() {
+    # Detect overlay build
+    if ! lsmod 2>/dev/null | awk '$1 ~ /^audioreach/ { found=1; exit } END { exit !found }'; then
+        log_info "Base build detected (no audioreach modules), skipping overlay setup"
+        return 0
+    fi
+    
+    log_info "Overlay build detected (audioreach modules present), configuring environment..."
+    
+    # Check root permissions
+    if [ "$(id -u)" -ne 0 ]; then
+        log_fail "Overlay audio setup requires root permissions"
+        return 1
+    fi
+    
+    # Configure DMA heap permissions
+    if [ -e /dev/dma_heap/system ]; then
+        log_info "Setting permissions on /dev/dma_heap/system"
+        chmod 666 /dev/dma_heap/system || {
+            log_fail "Failed to chmod /dev/dma_heap/system"
+            return 1
+        }
+    else
+        log_warn "/dev/dma_heap/system not found, skipping chmod"
+    fi
+    
+    # Check systemctl availability
+    if ! command -v systemctl >/dev/null 2>&1; then
+        log_fail "systemctl not available, cannot restart pipewire"
+        return 1
+    fi
+    
+    # Restart PipeWire
+    log_info "Restarting pipewire service..."
+    if ! systemctl restart pipewire 2>/dev/null; then
+        log_fail "Failed to restart pipewire service"
+        return 1
+    fi
+    
+    # Wait for PipeWire with polling (max 60s, check every 2s)
+    log_info "Waiting for pipewire to be ready..."
+    max_wait=60
+    elapsed=0
+    poll_interval=2
+    
+    while [ $elapsed -lt $max_wait ]; do
+        # Check if pipewire process is running
+        if pgrep -x pipewire >/dev/null 2>&1; then
+            # Verify wpctl can communicate
+            if command -v wpctl >/dev/null 2>&1 && wpctl status >/dev/null 2>&1; then
+                log_pass "PipeWire is ready (took ${elapsed}s)"
+                return 0
+            fi
+        fi
+        
+        sleep $poll_interval
+        elapsed=$((elapsed + poll_interval))
+        
+        if [ $((elapsed % 10)) -eq 0 ]; then
+            log_info "Still waiting for pipewire... (${elapsed}s/${max_wait}s)"
+        fi
+    done
+    
+    # Timeout reached
+    log_fail "PipeWire failed to become ready within ${max_wait}s"
+    log_fail "Check 'systemctl status pipewire' and 'journalctl -u pipewire' for details"
+    return 1
+}
  
 # ---------- PipeWire: sinks (playback) ----------
 pw_default_speakers() {
