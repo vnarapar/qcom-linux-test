@@ -782,6 +782,63 @@ weston_start() {
     return 1
 }
 
+overlay_start_weston_drm() {
+    EGL_JSON="/usr/share/glvnd/egl_vendor.d/EGL_adreno.json"
+ 
+    if [ -f "$EGL_JSON" ]; then
+        export __EGL_VENDOR_LIBRARY_FILENAMES="$EGL_JSON"
+        log_info "Overlay EGL: using vendor JSON: $EGL_JSON"
+    fi
+ 
+    RUNTIME_DIR="/dev/socket/weston"
+    if ! mkdir -p "$RUNTIME_DIR"; then
+        log_warn "Failed to create runtime dir $RUNTIME_DIR; falling back to /run/user/0"
+        RUNTIME_DIR="/run/user/0"
+        mkdir -p "$RUNTIME_DIR" || true
+    fi
+    chmod 700 "$RUNTIME_DIR" 2>/dev/null || true
+ 
+    XDG_RUNTIME_DIR="$RUNTIME_DIR"
+    export XDG_RUNTIME_DIR
+ 
+    # Do NOT force a specific WAYLAND_DISPLAY; let Weston decide.
+    unset WAYLAND_DISPLAY
+ 
+    log_dir=${1:-$PWD}
+    WESTON_LOG="$log_dir/weston.log"
+    log_info "Overlay Weston start: XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR (WAYLAND_DISPLAY=<auto>)"
+    log_info "Weston log: $WESTON_LOG"
+ 
+    # Start Weston in the background; we intentionally do not track the PID
+    # here to avoid killing it while clients are still using the socket.
+    weston --continue-without-input --idle-time=0 --log="$WESTON_LOG" \
+        >/dev/null 2>&1 &
+ 
+    # Best-effort check: see if ANY wayland-* socket appears, but do not kill Weston.
+    i=0
+    sock_found=""
+    while [ "$i" -lt 10 ]; do
+        for candidate in "$XDG_RUNTIME_DIR"/wayland-*; do
+            [ -S "$candidate" ] || continue
+            sock_found="$candidate"
+            break
+        done
+        [ -n "$sock_found" ] && break
+        sleep 1
+        i=$((i + 1))
+    done
+ 
+    if [ -n "$sock_found" ]; then
+        log_info "Overlay Weston created Wayland socket at $sock_found"
+        # We still let the caller discover/adopt the env via
+        # discover_wayland_socket_anywhere + adopt_wayland_env_from_socket.
+        return 0
+    fi
+ 
+    log_warn "Overlay Weston did not create a Wayland socket under $XDG_RUNTIME_DIR (see $WESTON_LOG)"
+    return 1
+}
+
 # Choose a socket (or try to start), adopt env, and echo chosen path.
 wayland_choose_or_start() {
     wayland_debug_snapshot "pre-choose"
@@ -983,17 +1040,44 @@ find_wayland_socket_in() {
 
 # Best-effort discovery of a usable Wayland socket anywhere.
 discover_wayland_socket_anywhere() {
+    # Prefer an already-configured, valid env
+    if [ -n "$XDG_RUNTIME_DIR" ] && [ -n "$WAYLAND_DISPLAY" ] &&
+       [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+        printf '%s\n' "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
+        return 0
+    fi
+
     uid="$(id -u 2>/dev/null || echo 0)"
     bases=""
-    [ -n "$XDG_RUNTIME_DIR" ] && bases="$bases $XDG_RUNTIME_DIR"
+
+    # If caller set XDG_RUNTIME_DIR, keep it as highest priority
+    if [ -n "$XDG_RUNTIME_DIR" ]; then
+        bases="$bases $XDG_RUNTIME_DIR"
+    fi
+
+    # Common locations on Linux/Android
     bases="$bases /dev/socket/weston /run/user/$uid /tmp/wayland-$uid /dev/shm"
+
     for b in $bases; do
-        ensure_private_runtime_dir "$b" >/dev/null 2>&1 || true
-        if s="$(find_wayland_socket_in "$b")"; then
+        [ -d "$b" ] || continue
+        if s="$(find_wayland_socket_in "$b" 2>/dev/null)"; then
+            [ -n "$s" ] || continue
             printf '%s\n' "$s"
             return 0
         fi
     done
+
+    # Fallback: scan all /run/user/* (handles Weston running as a different UID,
+    # e.g. weston user with UID 1000 while tests run as root).
+    for d in /run/user/*; do
+        [ -d "$d" ] || continue
+        if s="$(find_wayland_socket_in "$d" 2>/dev/null)"; then
+            [ -n "$s" ] || continue
+            printf '%s\n' "$s"
+            return 0
+        fi
+    done
+
     return 1
 }
 
@@ -1005,16 +1089,27 @@ adopt_wayland_env_from_socket() {
         log_warn "adopt_wayland_env_from_socket: invalid socket: ${s:-<empty>}"
         return 1
     fi
-    XDG_RUNTIME_DIR="$(dirname "$s")"
-    WAYLAND_DISPLAY="$(basename "$s")"
+
+    dir="$(dirname "$s")"
+    name="$(basename "$s")"
+
+    if [ -z "$dir" ] || [ -z "$name" ]; then
+        log_warn "adopt_wayland_env_from_socket: could not derive env from '$s'"
+        return 1
+    fi
+
+    XDG_RUNTIME_DIR="$dir"
+    WAYLAND_DISPLAY="$name"
     export XDG_RUNTIME_DIR WAYLAND_DISPLAY
-    # Best-effort perms fix for minimal systems
+
+    # Best-effort perms fix for minimal systems (ignore errors)
     chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+
     log_info "Adopting Wayland environment from socket: $s"
     log_info "Adopted Wayland env: XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR WAYLAND_DISPLAY=$WAYLAND_DISPLAY"
     log_info "Reproduce with:"
-    log_info "  export XDG_RUNTIME_DIR='$XDG_RUNTIME_DIR'"
-    log_info "  export WAYLAND_DISPLAY='$WAYLAND_DISPLAY'"
+    log_info " export XDG_RUNTIME_DIR='$XDG_RUNTIME_DIR'"
+    log_info " export WAYLAND_DISPLAY='$WAYLAND_DISPLAY'"
 }
 
 # Try to connect to Wayland. Returns 0 on OK.
@@ -1030,43 +1125,119 @@ wayland_can_connect() {
 
 # Ensure a Weston socket exists; if not, stop+start Weston and adopt helper socket.
 weston_pick_env_or_start() {
-    sock="$(discover_wayland_socket_anywhere 2>/dev/null || true)"
-    if [ -n "$sock" ]; then
-        adopt_wayland_env_from_socket "$sock"
-        log_info "Selected Wayland socket: $sock"
+    ctx="${1:-weston_pick_env_or_start}"
+    sock=""
+ 
+    # Honor WESTON_LOG_DIR for any Weston logs that helpers might write
+    log_dir="${WESTON_LOG_DIR:-/tmp}"
+    log_info "$ctx: Weston logs (if any) will be under: $log_dir"
+ 
+    # 0) If env already points to a valid socket, keep it.
+    if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -n "${WAYLAND_DISPLAY:-}" ] \
+       && [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+        log_info "$ctx: Using existing Wayland env: $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
         return 0
     fi
-
-    if weston_is_running; then
-        log_info "Stopping Weston..."
-        weston_stop
-        i=0; while weston_is_running && [ "$i" -lt 5 ]; do i=$((i+1)); sleep 1; done
+ 
+    # 1) Try to discover any existing Wayland socket first.
+    if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+        sock="$(discover_wayland_socket_anywhere 2>/dev/null | head -n 1)"
+    elif command -v find_wayland_socket_in >/dev/null 2>&1; then
+        uid="$(id -u 2>/dev/null || echo 0)"
+        bases=""
+        [ -n "${XDG_RUNTIME_DIR:-}" ] && bases="$bases $XDG_RUNTIME_DIR"
+        bases="$bases /run/user/$uid /dev/socket/weston /tmp/wayland-$uid"
+        for b in $bases; do
+            [ -z "$b" ] && continue
+            if s="$(find_wayland_socket_in "$b" 2>/dev/null || true)"; then
+                if [ -n "$s" ]; then
+                    sock="$s"
+                    break
+                fi
+            fi
+        done
     fi
-
-    log_info "Starting Weston..."
-    weston_start
-    i=0; sock=""
-    while [ "$i" -lt 6 ]; do
-        sock="$(find_wayland_socket_in /dev/socket/weston 2>/dev/null || true)"
-        [ -n "$sock" ] && break
-        sleep 1; i=$((i+1))
-    done
-    if [ -z "$sock" ]; then
-        log_fail "Could not find Wayland socket after starting Weston."
+ 
+    if [ -n "$sock" ]; then
+        if adopt_wayland_env_from_socket "$sock"; then
+            log_info "$ctx: Selected existing Wayland socket: $sock"
+            return 0
+        fi
+        log_warn "$ctx: Failed to adopt env from existing socket: $sock"
         return 1
     fi
-    adopt_wayland_env_from_socket "$sock"
-    log_info "Weston started; socket: $sock"
+ 
+    # 2) No socket found → restart Weston and wait for a new one.
+    if weston_is_running; then
+        log_info "$ctx: Weston is running but no socket found; stopping..."
+        weston_stop
+        i=0
+        while weston_is_running && [ "$i" -lt 5 ]; do
+            i=$((i + 1))
+            sleep 1
+        done
+    fi
+ 
+    uid="$(id -u 2>/dev/null || echo 0)"
+ 
+    # Ensure XDG_RUNTIME_DIR before starting Weston (manual mkdir, no external helpers).
+    if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+        if mkdir -p "/run/user/$uid" 2>/dev/null; then
+            chmod 700 "/run/user/$uid" 2>/dev/null || true
+            XDG_RUNTIME_DIR="/run/user/$uid"
+        elif mkdir -p "/dev/socket/weston" 2>/dev/null; then
+            chmod 700 "/dev/socket/weston" 2>/dev/null || true
+            XDG_RUNTIME_DIR="/dev/socket/weston"
+        fi
+        export XDG_RUNTIME_DIR
+        log_info "$ctx: XDG_RUNTIME_DIR set to '$XDG_RUNTIME_DIR' before starting Weston"
+    else
+        mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
+        chmod 700 "$XDG_RUNTIME_DIR" 2>/dev/null || true
+        log_info "$ctx: Using existing XDG_RUNTIME_DIR='$XDG_RUNTIME_DIR' before starting Weston"
+    fi
+ 
+    # Never pre-set WAYLAND_DISPLAY; let Weston choose.
+    unset WAYLAND_DISPLAY
+ 
+    log_info "$ctx: Starting Weston..."
+    weston_start
+ 
+    # 3) Wait up to ~10 seconds for any Wayland socket to appear.
+    i=0
+    sock=""
+    while [ "$i" -lt 10 ]; do
+        if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+            sock="$(discover_wayland_socket_anywhere 2>/dev/null | head -n 1)"
+        elif [ -n "${XDG_RUNTIME_DIR:-}" ] && command -v find_wayland_socket_in >/devnull 2>&1; then
+            sock="$(find_wayland_socket_in "$XDG_RUNTIME_DIR" 2>/dev/null || true)"
+        fi
+        if [ -n "$sock" ]; then
+            break
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+ 
+    if [ -z "$sock" ]; then
+        log_fail "$ctx: Could not find Wayland socket after starting Weston."
+        return 1
+    fi
+ 
+    if ! adopt_wayland_env_from_socket "$sock"; then
+        log_fail "$ctx: Failed to adopt env from socket: $sock"
+        return 1
+    fi
+ 
+    log_info "$ctx: Weston started; socket: $sock"
     return 0
 }
 
 # Find candidate Wayland sockets in common locations.
 # Prints absolute socket paths, one per line, most-preferred first.
 find_wayland_sockets() {
-    # Enumerate plausible Wayland sockets (one per line)
     uid="$(id -u 2>/dev/null || echo 0)"
  
-    # Current env first (if valid)
     if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -n "${WAYLAND_DISPLAY:-}" ] &&
        [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
         echo "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
@@ -1080,20 +1251,19 @@ find_wayland_sockets() {
         [ -S "$f" ] && echo "$f"
     done 2>/dev/null
  
-    # Any user under /run/user (root can traverse) — covers weston running as uid 1000
+    # Any other user under /run/user (covers weston as uid 100, 1000, etc.)
     for d in /run/user/*; do
         [ -d "$d" ] || continue
+        [ "$d" = "/run/user/$uid" ] && continue  # skip current uid, already handled above
         for f in "$d"/wayland-*; do
             [ -S "$f" ] && echo "$f"
         done
     done 2>/dev/null
  
-    # weston-launch sockets
     for f in /dev/socket/weston/wayland-*; do
         [ -S "$f" ] && echo "$f"
     done 2>/dev/null
  
-    # Last resort
     for f in /tmp/wayland-*; do
         [ -S "$f" ] && echo "$f"
     done 2>/dev/null
@@ -1133,36 +1303,57 @@ ensure_wayland_runtime_dir_perms() {
 # Prefers `wayland-info` with a short timeout; otherwise validates socket presence.
 # Also enforces/fixes XDG_RUNTIME_DIR permissions so clients won’t reject it.
 wayland_connection_ok() {
+    # Sanity-check the socket path first.
+    if [ -z "$XDG_RUNTIME_DIR" ] || [ -z "$WAYLAND_DISPLAY" ]; then
+        log_warn "wayland_connection_ok: XDG_RUNTIME_DIR or WAYLAND_DISPLAY not set"
+    elif [ ! -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+        log_warn "wayland_connection_ok: no Wayland socket at $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
+        return 1
+    else
+        log_info "wayland_connection_ok: using socket $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
+    fi
+
     if command -v wayland-info >/dev/null 2>&1; then
         log_info "Probing Wayland with: wayland-info"
         wayland-info >/dev/null 2>&1 && return 0
         return 1
     fi
+
     if command -v weston-info >/dev/null 2>&1; then
         log_info "Probing Wayland with: weston-info"
         weston-info >/dev/null 2>&1 && return 0
         return 1
     fi
+
     if command -v weston-simple-egl >/dev/null 2>&1; then
         log_info "Probing Wayland by briefly starting weston-simple-egl"
-        ( weston-simple-egl >/dev/null 2>&1 & echo $! >"/tmp/.wsegl.$$" )
-        pid="$(cat "/tmp/.wsegl.$$" 2>/dev/null || echo)"
+        (
+            weston-simple-egl >/dev/null 2>&1 &
+            echo "$!" >"/tmp/.wsegl.$$"
+        )
+        pid="$(cat "/tmp/.wsegl.$$" 2>/dev/null || echo '')"
         rm -f "/tmp/.wsegl.$$" 2>/dev/null || true
+
         i=0
-        while [ $i -lt 2 ]; do
+        while [ "$i" -lt 2 ]; do
             sleep 1
-            i=$((i+1))
+            i=$((i + 1))
         done
+
         if [ -n "$pid" ]; then
             kill "$pid" 2>/dev/null || true
         fi
         # If it started at all, consider the connection OK (best effort).
         return 0
     fi
-    if [ -n "$XDG_RUNTIME_DIR" ] && [ -n "$WAYLAND_DISPLAY" ] && [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+
+    # Last resort: trust socket existence alone.
+    if [ -n "$XDG_RUNTIME_DIR" ] && [ -n "$WAYLAND_DISPLAY" ] &&
+       [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
         log_info "No probe tools present; accepting socket existence as OK."
         return 0
     fi
+
     return 1
 }
 # Very verbose snapshot for debugging (processes, sockets, env, perms).
@@ -3519,12 +3710,30 @@ is_process_running() {
         log_info "Usage: is_running <process_name_or_pid>"
         return 1
     fi
+ 
     input="$1"
     case "$input" in
     ''|*[!0-9]*)
         # Non-numeric input: treat as process name
-        if ps -e | grep -w "$input" >/dev/null 2>&1 ||
-            ps -A | grep -w "$input" >/dev/null 2>&1; then
+        found=0
+ 
+        # Prefer pgrep if available (ShellCheck-friendly, efficient)
+        if command -v pgrep >/dev/null 2>&1; then
+            if pgrep -x "$input" >/dev/null 2>&1; then
+                found=1
+            fi
+        else
+            # POSIX fallback: avoid 'ps | grep' to silence SC2009
+            # Match as a separate word to mimic 'grep -w'
+            if ps -e 2>/dev/null | awk -v name="$input" '
+                $0 ~ ("(^|[[:space:]])" name "([[:space:]]|$)") { exit 0 }
+                END { exit 1 }
+            '; then
+                found=1
+            fi
+        fi
+ 
+        if [ "$found" -eq 1 ]; then
             log_info "Process '$input' is running."
             return 0
         else
