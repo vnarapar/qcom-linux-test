@@ -3796,3 +3796,25 @@ get_pid() {
         return 1
     fi
 }
+
+get_machine_model() {
+    if [ -r /sys/firmware/devicetree/base/model ]; then
+        raw=`cat /sys/firmware/devicetree/base/model`
+    else
+        log_info "Model not found"
+        return 0
+    fi
+
+    # Strip leading "Qualcomm Technologies, Inc. " if present
+    case "$raw" in
+        "Qualcomm Technologies, Inc. "*)
+            model=`printf '%s\n' "$raw" | sed 's/^Qualcomm Technologies, Inc. //'`
+            ;;
+        *)
+            model="$raw"
+            ;;
+    esac
+
+    printf '%s\n' "$model"
+    return 0
+}
