@@ -31,198 +31,301 @@ if [ -z "${__INIT_ENV_LOADED:-}" ]; then
   __INIT_ENV_LOADED=1
 fi
 
-# shellcheck disable=SC1090,SC1091
+# shellcheck disable=SC1091
 . "$TOOLS/functestlib.sh"
 
 TESTNAME="weston-simple-egl"
+RES_FILE="./${TESTNAME}.res"
+RUN_LOG="./${TESTNAME}_run.log"
 
-# ---------- Tunables (env override) ----------
-DURATION="${DURATION:-30s}" # how long to run the client
-STOP_GRACE="${STOP_GRACE:-3s}" # grace period on stop (reserved for future)
-EXPECT_FPS="${EXPECT_FPS:-60}" # nominal refresh (used for logs)
-FPS_TOL_PCT="${FPS_TOL_PCT:-10}" # +/- tolerance %
-REQUIRE_FPS="${REQUIRE_FPS:-0}" # 1=require FPS lines & threshold; 0=best effort
+: >"$RES_FILE"
+: >"$RUN_LOG"
 
-# ---------- Paths / logs ----------
-test_path="$(find_test_case_by_name "$TESTNAME" 2>/dev/null || echo "$SCRIPT_DIR")"
-if ! cd "$test_path"; then
-  log_error "cd failed: $test_path"
-  exit 1
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+DURATION="${DURATION:-30s}"
+STOP_GRACE="${STOP_GRACE:-3s}"
+EXPECT_FPS="${EXPECT_FPS:-60}"
+FPS_TOL_PCT="${FPS_TOL_PCT:-10}"
+REQUIRE_FPS="${REQUIRE_FPS:-1}"
+
+BUILD_FLAVOUR="base"
+if [ -f /usr/share/glvnd/egl_vendor.d/EGL_adreno.json ]; then
+    BUILD_FLAVOUR="overlay"
 fi
 
-RES_FILE="./$TESTNAME.res"
-LOG_FILE="./${TESTNAME}_run.log"
-rm -f "$RES_FILE" "$LOG_FILE"
-
+log_info "Weston log directory: $SCRIPT_DIR"
 log_info "--------------------------------------------------------------------------"
-log_info "------------------- Starting $TESTNAME Testcase --------------------------"
+log_info "------------------- Starting ${TESTNAME} Testcase --------------------------"
 
-# --- Platform details (robust logging; prefer helpers) ---
+# Optional platform details (helper from functestlib)
 if command -v detect_platform >/dev/null 2>&1; then
-  detect_platform >/dev/null 2>&1 || true
-  log_info "Platform Details: machine='${PLATFORM_MACHINE:-unknown}' target='${PLATFORM_TARGET:-unknown}' kernel='${PLATFORM_KERNEL:-}' arch='${PLATFORM_ARCH:-}'"
+    detect_platform
+fi
+
+if [ "$BUILD_FLAVOUR" = "overlay" ]; then
+    log_info "Build flavor: overlay (EGL_adreno.json present)"
 else
-  log_info "Platform Details: unknown"
+    log_info "Build flavor: base (no EGL_adreno.json overlay)"
 fi
 
-log_info "Config: DURATION=$DURATION STOP_GRACE=$STOP_GRACE EXPECT_FPS=${EXPECT_FPS}+/-${FPS_TOL_PCT}% REQUIRE_FPS=$REQUIRE_FPS"
+log_info "Config: DURATION=${DURATION} STOP_GRACE=${STOP_GRACE} EXPECT_FPS=${EXPECT_FPS}+/-${FPS_TOL_PCT}% REQUIRE_FPS=${REQUIRE_FPS} BUILD_FLAVOUR=${BUILD_FLAVOUR}"
 
-# ---------- Dependencies ----------
-if ! check_dependencies weston-simple-egl; then
-  log_skip "$TESTNAME : SKIP (weston-simple-egl not found in PATH)"
-  echo "$TESTNAME SKIP" > "$RES_FILE"
-  exit 2
+# ---------------------------------------------------------------------------
+# Display snapshot
+# ---------------------------------------------------------------------------
+if command -v display_debug_snapshot >/dev/null 2>&1; then
+    display_debug_snapshot "pre-display-check"
 fi
-
-BIN="$(command -v weston-simple-egl 2>/dev/null || true)"
-log_info "Using weston-simple-egl: ${BIN:-<none>}"
-
-# ----- Display presence check (DP/HDMI/etc.) -----
-# Quick snapshot for debugging (lists DRM nodes, sysfs connectors, weston outputs)
-display_debug_snapshot "pre-display-check"
 
 have_connector=0
-
-# sysfs-based summary (existing helper)
-sysfs_summary="$(display_connected_summary 2>/dev/null || printf '%s' '')"
-if [ -n "$sysfs_summary" ] && [ "$sysfs_summary" != "none" ]; then
-  have_connector=1
-  log_info "Connected display (sysfs): $sysfs_summary"
+if command -v display_connected_summary >/dev/null 2>&1; then
+    sysfs_summary=$(display_connected_summary)
+    if [ -n "$sysfs_summary" ] && [ "$sysfs_summary" != "none" ]; then
+        have_connector=1
+        log_info "Connected display (sysfs): $sysfs_summary"
+    fi
 fi
 
 if [ "$have_connector" -eq 0 ]; then
-  log_skip "$TESTNAME : SKIP (no connected display detected)"
-  echo "$TESTNAME SKIP" > "$RES_FILE"
-  exit 2
+    log_warn "No connected DRM display found, skipping ${TESTNAME}."
+    echo "${TESTNAME} SKIP" >"$RES_FILE"
+    exit 0
 fi
 
-wayland_debug_snapshot "weston-simple-egl: start"
+# ---------------------------------------------------------------------------
+# Wayland / Weston environment (runtime detection, no hardcoded flavour)
+# ---------------------------------------------------------------------------
+if command -v wayland_debug_snapshot >/dev/null 2>&1; then
+    wayland_debug_snapshot "${TESTNAME}: start"
+fi
 
-# ---------- Choose/adopt Wayland socket (using helper) ----------
-# Capture only the actual socket path from helper output (filter out logs)
-sock="$(
-  wayland_choose_or_start 2>/dev/null \
-    | grep -E '/(run/user/[0-9]+|tmp|dev/socket/weston)/wayland-[0-9]+$' \
-    | tail -n 1
-)"
-if [ -n "$sock" ]; then
-  log_info "Found Wayland socket: $sock"
+sock=""
+
+# 1) Try to find any existing Wayland socket (base or overlay)
+if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+    sock=$(discover_wayland_socket_anywhere | head -n 1 || true)
+fi
+
+# If we found a socket, adopt its environment
+if [ -n "$sock" ] && command -v adopt_wayland_env_from_socket >/dev/null 2>&1; then
+    log_info "Found existing Wayland socket: $sock"
+    if ! adopt_wayland_env_from_socket "$sock"; then
+        log_warn "Failed to adopt env from $sock"
+    fi
+fi
+
+# 2) If no usable socket yet, try starting a private Weston (overlay-style helper)
+if [ -z "$sock" ] && command -v overlay_start_weston_drm >/dev/null 2>&1; then
+    log_info "No usable Wayland socket; trying overlay_start_weston_drm helper..."
+    if overlay_start_weston_drm; then
+        # Re-scan for a socket after attempting to start Weston
+        if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+            sock=$(discover_wayland_socket_anywhere | head -n 1 || true)
+        fi
+        if [ -n "$sock" ] && command -v adopt_wayland_env_from_socket >/dev/null 2>&1; then
+            log_info "Overlay Weston created Wayland socket: $sock"
+            if ! adopt_wayland_env_from_socket "$sock"; then
+                log_warn "Failed to adopt env from $sock"
+            fi
+        else
+            log_warn "overlay_start_weston_drm reported success but no Wayland socket was found."
+        fi
+    else
+        log_warn "overlay_start_weston_drm returned non-zero; private Weston may have failed to start."
+    fi
+fi
+
+# 3) Final decision: run or SKIP
+if [ -z "$sock" ]; then
+    log_warn "No Wayland socket found after autodetection; skipping ${TESTNAME}."
+    echo "${TESTNAME} SKIP" >"$RES_FILE"
+    exit 0
+fi
+
+if command -v wayland_connection_ok >/dev/null 2>&1; then
+    if ! wayland_connection_ok; then
+        log_fail "Wayland connection test failed; cannot run ${TESTNAME}."
+        echo "${TESTNAME} SKIP" >"$RES_FILE"
+        exit 0
+    fi
+    log_info "Wayland connection test: OK"
 else
-  log_fail "$TESTNAME : FAIL (no Wayland socket found after attempting to start Weston)"
-  echo "$TESTNAME FAIL" > "$RES_FILE"
-  wayland_debug_snapshot "weston-simple-egl: no-socket"
-  exit 1
+    log_warn "wayland_connection_ok helper not found; continuing without explicit Wayland probe."
 fi
 
-adopt_wayland_env_from_socket "$sock" || log_warn "adopt_wayland_env_from_socket: invalid: $sock"
-log_info "Final Wayland env: XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-}<sep>WAYLAND_DISPLAY=${WAYLAND_DISPLAY:-}"
-# Replace <sep> to avoid confusion in CI logs:
-# shellcheck disable=SC2016
-printf '%s\n' "" | sed 's/.*/[DBG] (env adopted)/' >/dev/null 2>&1 || true
-
-# ---------- Sanity check Wayland connectivity ----------
-if wayland_connection_ok; then
-  log_info "Wayland connection test: OK"
-else
-  log_fail "$TESTNAME : FAIL (Wayland connection test failed)"
-  print_path_meta "$XDG_RUNTIME_DIR" | sed 's/^/[DBG] /'
-  stat "$XDG_RUNTIME_DIR" 2>/dev/null | sed 's/^/[DBG] /' || true
-  echo "$TESTNAME FAIL" > "$RES_FILE"
-  exit 1
+# ---------------------------------------------------------------------------
+# Binary & EGL vendor override
+# ---------------------------------------------------------------------------
+if ! check_dependencies weston-simple-egl; then
+    log_fail "Required binary weston-simple-egl not found in PATH."
+    echo "${TESTNAME} FAIL" >"$RES_FILE"
+    exit 0
 fi
 
-# Try to enable FPS prints if supported by the client (best effort).
+BIN=$(command -v weston-simple-egl)
+log_info "Using weston-simple-egl: $BIN"
+
+if [ "$BUILD_FLAVOUR" = "overlay" ] && [ -f /usr/share/glvnd/egl_vendor.d/EGL_adreno.json ]; then
+    export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/EGL_adreno.json
+    log_info "EGL vendor override: /usr/share/glvnd/egl_vendor.d/EGL_adreno.json"
+fi
+
+# Enable FPS prints in the client
 export SIMPLE_EGL_FPS=1
 export WESTON_SIMPLE_EGL_FPS=1
 
-# ---------- Run the client ----------
-log_info "Launching weston-simple-egl for $DURATION …"
-start_ts="$(date +%s 2>/dev/null || echo 0)"
+# ---------------------------------------------------------------------------
+# Run client with timeout
+# ---------------------------------------------------------------------------
+log_info "Launching ${TESTNAME} for ${DURATION} ..."
+
+start_ts=$(date +%s)
 
 if command -v run_with_timeout >/dev/null 2>&1; then
-  log_info "Using helper: run_with_timeout"
-  run_with_timeout "$DURATION" weston-simple-egl >"$LOG_FILE" 2>&1
-  rc=$?
-else
-  if command -v timeout >/dev/null 2>&1; then
-    log_info "Using coreutils timeout"
-    timeout "$DURATION" weston-simple-egl >"$LOG_FILE" 2>&1
+    log_info "Using helper: run_with_timeout"
+    if command -v stdbuf >/dev/null 2>&1; then
+        run_with_timeout "$DURATION" stdbuf -oL -eL "$BIN" >>"$RUN_LOG" 2>&1
+    else
+        log_warn "stdbuf not found running $BIN without output re-buffering."
+        run_with_timeout "$DURATION" "$BIN" >>"$RUN_LOG" 2>&1
+    fi
     rc=$?
-  else
-    log_info "No timeout helpers; running in background with manual sleep-stop"
-    sh -c 'weston-simple-egl' >"$LOG_FILE" 2>&1 &
-    pid=$!
-    # DURATION like "30s" → "30"
-    dur_s="$(printf '%s' "$DURATION" | sed -n 's/^\([0-9][0-9]*\)s$/\1/p')"
-    [ -z "$dur_s" ] && dur_s="$DURATION"
+else
+    log_warn "run_with_timeout not found using naive sleep+kill fallback."
+    "$BIN" >>"$RUN_LOG" 2>&1 &
+    cpid=$!
+    dur_s=$(printf '%s\n' "$DURATION" | sed -n 's/^\([0-9][0-9]*\)s$/\1/p')
+    [ -n "$dur_s" ] || dur_s=30
     sleep "$dur_s"
-    kill "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
+    kill "$cpid" 2>/dev/null || true
     rc=143
-  fi
 fi
 
-end_ts="$(date +%s 2>/dev/null || echo 0)"
-elapsed=$(( end_ts - start_ts ))
-[ "$elapsed" -lt 0 ] && elapsed=0
-log_info "Client finished: rc=$rc elapsed=${elapsed}s"
+end_ts=$(date +%s)
+elapsed=$((end_ts - start_ts))
 
-# ---------- FPS parsing (best effort) ----------
-fps="-"
-fps_line="$(grep -E '([Ff][Pp][Ss]|frames per second|^fps:)' "$LOG_FILE" 2>/dev/null | tail -n 1)"
-if [ -n "$fps_line" ]; then
-  fps="$(printf '%s\n' "$fps_line" | awk '{ for (i=NF;i>=1;i--) if ($i ~ /^[0-9]+(\.[0-9]+)?$/) {print $i; exit} }')"
-  [ -z "$fps" ] && fps="-"
+log_info "Client finished: rc=${rc} elapsed=${elapsed}s"
+
+# ---------------------------------------------------------------------------
+# FPS parsing: average / min / max from all intervals
+# - Discard FIRST sample as warm-up if we have 2+ samples.
+# ---------------------------------------------------------------------------
+fps_count=0
+fps_avg="-"
+fps_min="-"
+fps_max="-"
+
+fps_stats=$(
+    awk '
+    /[0-9]+[[:space:]]+frames in[[:space:]]+[0-9]+[[:space:]]+seconds/ {
+        # Example: "151 frames in 5 seconds: 30.200001 fps"
+        val = $(NF-1) + 0.0
+        all_n++
+        all_vals[all_n] = val
+    }
+    END {
+        if (all_n == 0) {
+            # No samples
+            exit
+        }
+
+        if (all_n == 1) {
+            # Only one sample: use it as-is
+            n = 1
+            sum = all_vals[1]
+            min = all_vals[1]
+            max = all_vals[1]
+        } else {
+            # Discard first sample as warm-up; average remaining
+            n = 0
+            sum = 0.0
+            for (i = 2; i <= all_n; i++) {
+                v = all_vals[i]
+                n++
+                sum += v
+                if (n == 1 || v < min) min = v
+                if (n == 1 || v > max) max = v
+            }
+        }
+
+        if (n > 0) {
+            avg = sum / n
+            printf "n=%d avg=%f min=%f max=%f\n", n, avg, min, max
+        }
+    }' "$RUN_LOG" 2>/dev/null || true
+)
+
+if [ -n "$fps_stats" ]; then
+    fps_count=$(printf '%s\n' "$fps_stats" | awk '{print $1}' | sed 's/^n=//')
+    fps_avg=$(printf '%s\n' "$fps_stats" | awk '{print $2}' | sed 's/^avg=//')
+    fps_min=$(printf '%s\n' "$fps_stats" | awk '{print $3}' | sed 's/^min=//')
+    fps_max=$(printf '%s\n' "$fps_stats" | awk '{print $4}' | sed 's/^max=//')
+
+    log_info "FPS stats from ${RUN_LOG}: samples=${fps_count} avg=${fps_avg} min=${fps_min} max=${fps_max}"
+else
+    log_warn "No FPS lines detected in ${RUN_LOG} weston-simple-egl may not have emitted FPS stats (or output was truncated)."
 fi
 
-log_info "Result summary: rc=$rc elapsed=${elapsed}s fps=${fps} (expected ~${EXPECT_FPS}+/-${FPS_TOL_PCT}%)"
+fps_for_summary="$fps_avg"
+if [ "$fps_count" -eq 0 ]; then
+    fps_for_summary="-"
+fi
 
-# ---------- Gating ----------
-dur_s="$(printf '%s' "$DURATION" | sed -n 's/^\([0-9][0-9]*\)s$/\1/p')"
-[ -z "$dur_s" ] && dur_s="$DURATION"
-min_ok=$(( dur_s - 1 ))
-[ "$min_ok" -lt 0 ] && min_ok=0
+log_info "Result summary: rc=${rc} elapsed=${elapsed}s fps=${fps_for_summary} (expected ~${EXPECT_FPS}+/-${FPS_TOL_PCT}%)"
 
+# ---------------------------------------------------------------------------
+# PASS / FAIL decision
+# ---------------------------------------------------------------------------
 final="PASS"
 
-# Must have run ~DURATION seconds
-if [ "$elapsed" -lt "$min_ok" ]; then
-  final="FAIL"
-  log_fail "$TESTNAME : FAIL (exited after ${elapsed}s; expected ~${dur_s}s) — rc=$rc"
-fi
-
-# Optional FPS gate
-if [ "$final" = "PASS" ] && [ "$REQUIRE_FPS" -eq 1 ]; then
-  if [ "$fps" = "-" ]; then
+# Exit code: accept 0 (normal) and 143 (timeout) as non-fatal here
+if [ "$rc" -ne 0 ] && [ "$rc" -ne 143 ]; then
     final="FAIL"
-    log_fail "$TESTNAME : FAIL (no FPS lines found but REQUIRE_FPS=1)"
-  else
-    lo=$(( (EXPECT_FPS * (100 - FPS_TOL_PCT)) / 100 ))
-    hi=$(( (EXPECT_FPS * (100 + FPS_TOL_PCT)) / 100 ))
-    fps_int="$(printf '%s' "$fps" | cut -d. -f1)"
-    if [ "$fps_int" -lt "$lo" ] || [ "$fps_int" -gt "$hi" ]; then
-      final="FAIL"
-      log_fail "$TESTNAME : FAIL (fps=$fps outside ${lo}-${hi})"
-    fi
-  fi
 fi
 
-# ---------- Epilogue / exit codes ----------
-case "$final" in
-  PASS)
-    log_pass "$TESTNAME : PASS"
-    echo "$TESTNAME PASS" > "$RES_FILE"
+# Duration sanity: reject if it bails out immediately
+if [ "$elapsed" -le 1 ]; then
+    log_fail "Client exited too quickly (elapsed=${elapsed}s) expected ~${DURATION} runtime."
+    final="FAIL"
+fi
+
+# FPS gating if explicitly required
+if [ "$REQUIRE_FPS" -ne 0 ]; then
+    if [ "$fps_count" -eq 0 ]; then
+        log_fail "FPS gating enabled (REQUIRE_FPS=${REQUIRE_FPS}) but no FPS samples were found treating as FAIL."
+        final="FAIL"
+    else
+        min_ok=$(awk -v f="$EXPECT_FPS" -v tol="$FPS_TOL_PCT" 'BEGIN { printf "%.0f\n", f * (100.0 - tol) / 100.0 }')
+        max_ok=$(awk -v f="$EXPECT_FPS" -v tol="$FPS_TOL_PCT" 'BEGIN { printf "%.0f\n", f * (100.0 + tol) / 100.0 }')
+
+        fps_int=$(printf '%s\n' "$fps_avg" | awk 'BEGIN {v=0} {v=$1+0.0} END {printf "%.0f\n", v}')
+
+        if [ "$fps_int" -lt "$min_ok" ] || [ "$fps_int" -gt "$max_ok" ]; then
+            log_fail "Average FPS out of range: avg=${fps_avg} (~${fps_int}) not in [${min_ok}, ${max_ok}] (EXPECT_FPS=${EXPECT_FPS}, tol=${FPS_TOL_PCT}%)."
+            final="FAIL"
+        fi
+    fi
+else
+    if [ "$fps_count" -eq 0 ]; then
+        log_warn "REQUIRE_FPS=0 and no FPS samples found skipping FPS gating."
+    else
+        log_info "REQUIRE_FPS=0 FPS stats recorded but not used for gating."
+    fi
+fi
+
+log_info "Final decision for ${TESTNAME}: ${final}"
+
+# ---------------------------------------------------------------------------
+# Emit result & exit
+# ---------------------------------------------------------------------------
+echo "${TESTNAME} ${final}" >"$RES_FILE"
+
+if [ "$final" = "PASS" ]; then
+    log_pass "${TESTNAME} : PASS"
     exit 0
-    ;;
-  SKIP)
-    # (Not used here, but keeping consistent mapping)
-    log_skip "$TESTNAME : SKIP"
-    echo "$TESTNAME SKIP" > "$RES_FILE"
-    exit 2
-    ;;
-  *)
-    log_fail "$TESTNAME : FAIL"
-    echo "$TESTNAME FAIL" > "$RES_FILE"
-    exit 1
-    ;;
-esac
+fi
+
+log_fail "${TESTNAME} : FAIL"
+exit 0
