@@ -1900,15 +1900,35 @@ dt_has_remoteproc_fw() {
 }
 
 # Find the remoteproc path for a given firmware substring (e.g., "adsp", "cdsp", "gdsp").
+# Logic:
+#   - grep -n over /sys/class/remoteproc/remoteproc*/firmware (one line per remoteproc)
+#   - Take the first matching line number (1-based)
+#   - Subtract 1 → remoteproc index → /sys/class/remoteproc/remoteproc${idx}
 get_remoteproc_path_by_firmware() {
-    name="$1"
-    idx path
-    # List all remoteproc firmware nodes, match name, and return the remoteproc path
-    idx=$(cat /sys/class/remoteproc/remoteproc*/firmware 2>/dev/null | grep -n "$name" | cut -d: -f1 | head -n1)
-    [ -z "$idx" ] && return 1
-    idx=$((idx - 1))
-    path="/sys/class/remoteproc/remoteproc${idx}"
-    [ -d "$path" ] && echo "$path" && return 0
+    name=$1
+ 
+    [ -n "$name" ] || return 1
+    [ -d /sys/class/remoteproc ] || return 1
+ 
+    for fw in /sys/class/remoteproc/remoteproc*/firmware; do
+        # Skip if glob didn't match any file
+        [ -f "$fw" ] || continue
+ 
+        # Read first line from firmware file without using cat
+        if IFS= read -r fwname <"$fw"; then
+            case "$fwname" in
+                *"$name"*)
+                    # Map firmware file back to its remoteproc directory
+                    dir=${fw%/firmware}
+                    if [ -d "$dir" ]; then
+                        printf '%s\n' "$dir"
+                        return 0
+                    fi
+                    ;;
+            esac
+        fi
+    done
+ 
     return 1
 }
 
