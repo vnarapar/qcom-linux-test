@@ -1,0 +1,37 @@
+metadata:
+  name: boot-systemd-validate
+  format: "Lava-Test Test Definition 1.0"
+  description: "Systemd boot KPI capture + required unit gating + artifacts (critical-chain, blame, plot, unit states)."
+  os:
+    - linux
+  scope:
+    - performance
+    - functional
+
+params:
+  OUT_DIR: "./logs_Boot_Systemd_Validate"
+
+  # Either provide REQUIRED_UNITS_FILE (existing file path) OR REQUIRED_UNITS (list).
+  # REQUIRED_UNITS supports commas/spaces and will be written to OUT_DIR/required_units.txt automatically.
+  REQUIRED_UNITS_FILE: ""
+  REQUIRED_UNITS: ""
+
+  TIMEOUT_PER_UNIT: "30"
+  SVG: "yes" # yes|no
+  BOOT_TYPE: "unknown" # cold|warm|unknown etc
+  DISABLE_GETTY: "0" # 1|0
+  DISABLE_SSHD: "0" # 1|0
+  EXCLUDE_NETWORKD_WAIT_ONLINE: "0" # 1|0
+  EXCLUDE_SERVICES: "" # space-separated service names
+  BOOT_KPI_ITERATIONS: "1"
+  VERBOSE: "0"
+
+  # Optional improvement: configurable boot-complete wait (seconds)
+  WAIT_FOR_BOOT_COMPLETE_TIMEOUT: "300"
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Performance/Boot_Systemd_Validate/
+    - ./run.sh || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh Boot_Systemd_Validate.res || true
