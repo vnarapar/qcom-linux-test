@@ -33,6 +33,8 @@ fi
 
 # shellcheck disable=SC1091
 . "$TOOLS/functestlib.sh"
+# shellcheck disable=SC1091
+. "$TOOLS/lib_display.sh"
 
 TESTNAME="weston-simple-egl"
 RES_FILE="./${TESTNAME}.res"
@@ -78,7 +80,19 @@ log_info "Config: DURATION=${DURATION} STOP_GRACE=${STOP_GRACE} EXPECT_FPS=${EXP
 if command -v display_debug_snapshot >/dev/null 2>&1; then
     display_debug_snapshot "pre-display-check"
 fi
-
+ 
+# Always print modetest as part of the snapshot (best-effort).
+# (Some lib_display.sh variants override display_debug_snapshot without modetest.)
+if command -v modetest >/dev/null 2>&1; then
+    log_info "----- modetest -M msm -ac (capped at 200 lines) -----"
+    modetest -M msm -ac 2>&1 | sed -n '1,200p' | while IFS= read -r l; do
+        [ -n "$l" ] && log_info "[modetest] $l"
+    done
+    log_info "----- End modetest -M msm -ac -----"
+else
+    log_warn "modetest not found in PATH skipping modetest snapshot."
+fi
+ 
 have_connector=0
 if command -v display_connected_summary >/dev/null 2>&1; then
     sysfs_summary=$(display_connected_summary)
@@ -87,13 +101,12 @@ if command -v display_connected_summary >/dev/null 2>&1; then
         log_info "Connected display (sysfs): $sysfs_summary"
     fi
 fi
-
+ 
 if [ "$have_connector" -eq 0 ]; then
     log_warn "No connected DRM display found, skipping ${TESTNAME}."
     echo "${TESTNAME} SKIP" >"$RES_FILE"
     exit 0
 fi
-
 # ---------------------------------------------------------------------------
 # Wayland / Weston environment (runtime detection, no hardcoded flavour)
 # ---------------------------------------------------------------------------
@@ -103,7 +116,7 @@ fi
 
 sock=""
 
-# 1) Try to find any existing Wayland socket (base or overlay)
+# Try to find any existing Wayland socket (base or overlay)
 if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
     sock=$(discover_wayland_socket_anywhere | head -n 1 || true)
 fi
@@ -116,9 +129,13 @@ if [ -n "$sock" ] && command -v adopt_wayland_env_from_socket >/dev/null 2>&1; t
     fi
 fi
 
-# 2) If no usable socket yet, try starting a private Weston (overlay-style helper)
+# If no usable socket yet, try starting a private Weston (overlay-style helper)
 if [ -z "$sock" ] && command -v overlay_start_weston_drm >/dev/null 2>&1; then
     log_info "No usable Wayland socket; trying overlay_start_weston_drm helper..."
+    if command -v weston_force_primary_1080p60_if_not_60 >/dev/null 2>&1; then
+        log_info "Pre-configuring primary output to ~60Hz before starting Weston (best-effort) ..."
+        weston_force_primary_1080p60_if_not_60 || true
+    fi
     if overlay_start_weston_drm; then
         # Re-scan for a socket after attempting to start Weston
         if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
@@ -137,7 +154,7 @@ if [ -z "$sock" ] && command -v overlay_start_weston_drm >/dev/null 2>&1; then
     fi
 fi
 
-# 3) Final decision: run or SKIP
+# Final decision: run or SKIP
 if [ -z "$sock" ]; then
     log_warn "No Wayland socket found after autodetection; skipping ${TESTNAME}."
     echo "${TESTNAME} SKIP" >"$RES_FILE"
@@ -152,7 +169,35 @@ if command -v wayland_connection_ok >/dev/null 2>&1; then
     fi
     log_info "Wayland connection test: OK"
 else
-    log_warn "wayland_connection_ok helper not found; continuing without explicit Wayland probe."
+    log_warn "wayland_connection_ok helper not found continuing without explicit Wayland probe."
+fi
+
+# ---------------------------------------------------------------------------
+# Ensure primary output is ~60Hz (best-effort, no churn if already ~60Hz)
+# - Must NOT change weston.ini behavior: that remains inside lib_display.sh
+# - First checks current mode (modetest path) or config (weston.ini path)
+# - Only attempts changes when NOT ~60Hz
+# ---------------------------------------------------------------------------
+if command -v display_debug_snapshot >/dev/null 2>&1; then
+    display_debug_snapshot "${TESTNAME}: before-ensure-60hz"
+fi
+if command -v wayland_debug_snapshot >/dev/null 2>&1; then
+    wayland_debug_snapshot "${TESTNAME}: before-ensure-60hz"
+fi
+
+if command -v weston_force_primary_1080p60_if_not_60 >/dev/null 2>&1; then
+    log_info "Ensuring primary output is ~60Hz (best-effort) ..."
+    if weston_force_primary_1080p60_if_not_60; then
+        log_info "Primary output is ~60Hz (or was already ~60Hz)."
+    else
+        log_warn "Unable to force ~60Hz (continuing; not a hard failure)."
+    fi
+else
+    log_warn "weston_force_primary_1080p60_if_not_60 helper not found; skipping ~60Hz enforcement."
+fi
+
+if command -v display_debug_snapshot >/dev/null 2>&1; then
+    display_debug_snapshot "${TESTNAME}: after-ensure-60hz"
 fi
 
 # ---------------------------------------------------------------------------
