@@ -1303,28 +1303,41 @@ ensure_wayland_runtime_dir_perms() {
 # Prefers `wayland-info` with a short timeout; otherwise validates socket presence.
 # Also enforces/fixes XDG_RUNTIME_DIR permissions so clients won’t reject it.
 wayland_connection_ok() {
+    sock=""
+ 
     # Sanity-check the socket path first.
     if [ -z "$XDG_RUNTIME_DIR" ] || [ -z "$WAYLAND_DISPLAY" ]; then
         log_warn "wayland_connection_ok: XDG_RUNTIME_DIR or WAYLAND_DISPLAY not set"
-    elif [ ! -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
-        log_warn "wayland_connection_ok: no Wayland socket at $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
-        return 1
     else
-        log_info "wayland_connection_ok: using socket $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
+        sock="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
+        if [ ! -S "$sock" ]; then
+            log_warn "wayland_connection_ok: no Wayland socket at $sock"
+            return 1
+        fi
+        log_info "wayland_connection_ok: using socket $sock"
     fi
-
+ 
     if command -v wayland-info >/dev/null 2>&1; then
         log_info "Probing Wayland with: wayland-info"
-        wayland-info >/dev/null 2>&1 && return 0
+        wayland-info >/dev/null 2>&1
+        rc=$?
+        [ "$rc" -eq 0 ] && return 0
+        # Accept common “killed by timeout/signal” cases as OK (best-effort probe)
+        [ "$rc" -eq 143 ] && return 0
+        [ "$rc" -eq 124 ] && return 0
         return 1
     fi
-
+ 
     if command -v weston-info >/dev/null 2>&1; then
         log_info "Probing Wayland with: weston-info"
-        weston-info >/dev/null 2>&1 && return 0
+        weston-info >/dev/null 2>&1
+        rc=$?
+        [ "$rc" -eq 0 ] && return 0
+        [ "$rc" -eq 143 ] && return 0
+        [ "$rc" -eq 124 ] && return 0
         return 1
     fi
-
+ 
     if command -v weston-simple-egl >/dev/null 2>&1; then
         log_info "Probing Wayland by briefly starting weston-simple-egl"
         (
@@ -1333,27 +1346,26 @@ wayland_connection_ok() {
         )
         pid="$(cat "/tmp/.wsegl.$$" 2>/dev/null || echo '')"
         rm -f "/tmp/.wsegl.$$" 2>/dev/null || true
-
+ 
         i=0
         while [ "$i" -lt 2 ]; do
             sleep 1
             i=$((i + 1))
         done
-
+ 
         if [ -n "$pid" ]; then
             kill "$pid" 2>/dev/null || true
         fi
         # If it started at all, consider the connection OK (best effort).
         return 0
     fi
-
+ 
     # Last resort: trust socket existence alone.
-    if [ -n "$XDG_RUNTIME_DIR" ] && [ -n "$WAYLAND_DISPLAY" ] &&
-       [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+    if [ -n "$sock" ] && [ -S "$sock" ]; then
         log_info "No probe tools present; accepting socket existence as OK."
         return 0
     fi
-
+ 
     return 1
 }
 # Very verbose snapshot for debugging (processes, sockets, env, perms).
@@ -1422,6 +1434,63 @@ print_path_meta() {
 ###############################################################################
 # DRM / Display helpers (portable, minimal-build friendly)
 ###############################################################################
+# Best-effort: return current mode for a DRM connector using debugfs state.
+# Input : full connector name like "card0-HDMI-A-1"
+# Output: "1920x1080@60.00" (or "1920x1080@60") or "-" if unknown/unavailable
+display_connector_cur_mode() {
+    full="$1"
+    [ -n "$full" ] || { echo "-"; return; }
+ 
+    card="${full%%-*}"    # card0
+    con="${full#*-}"      # HDMI-A-1
+    idx="${card#card}"    # 0
+ 
+    state="/sys/kernel/debug/dri/${idx}/state"
+ 
+    # debugfs may not be mounted; best-effort mount (ignore failures)
+    if [ ! -r "$state" ] && [ -r /proc/mounts ] && command -v mount >/dev/null 2>&1; then
+        if ! grep -q " /sys/kernel/debug " /proc/mounts 2>/dev/null; then
+            mount -t debugfs debugfs /sys/kernel/debug 2>/dev/null || true
+        fi
+    fi
+ 
+    [ -r "$state" ] || { echo "-"; return; }
+ 
+    awk -v CON="$con" '
+    BEGIN { crtc=""; in_conn=0; in_crtc=0; mode=""; vr=""; active="" }
+ 
+    # Connector block -> capture bound CRTC id
+    $0 ~ /^connector/ {
+        in_conn=0
+        if ($0 ~ CON) in_conn=1
+    }
+    in_conn && $0 ~ /crtc/ {
+        if (match($0, /[0-9]+/, m)) crtc=m[0]
+    }
+    in_conn && $0 ~ /^$/ { in_conn=0 }
+ 
+    # CRTC block -> capture active + mode + refresh
+    crtc != "" && $0 ~ /^crtc/ {
+        in_crtc=0
+        if ($0 ~ ("crtc " crtc)) in_crtc=1
+    }
+    in_crtc && $0 ~ /active/ {
+        if ($0 ~ /(yes|true|1)/) active="1"
+    }
+    in_crtc && $0 ~ /mode/ {
+        if (match($0, /[0-9]+x[0-9]+/, m)) mode=m[0]
+    }
+    in_crtc && ($0 ~ /vrefresh/ || $0 ~ /refresh/) {
+        if (match($0, /[0-9]+(\.[0-9]+)?/, m)) vr=m[0]
+    }
+    in_crtc && $0 ~ /^$/ { in_crtc=0 }
+ 
+    END {
+        if (crtc == "" || mode == "" || active != "1") { print "-"; exit }
+        if (vr != "") print mode "@" vr
+        else print mode
+    }' "$state" 2>/dev/null || echo "-"
+}
 
 # Echo lines: "<name>\t<status>\t<type>\t<modes>\t<first_mode>"
 # Example: "card0-HDMI-A-1 connected HDMI-A 9 1920x1080"
@@ -1433,8 +1502,14 @@ display_list_connectors() {
         name="$(basename "$d")"
         status="$(tr -d '\r\n' <"$d/status" 2>/dev/null)"
  
+        # enabled (best-effort; may not exist on some kernels)
+        enabled="unknown"
+        if [ -f "$d/enabled" ]; then
+            enabled="$(tr -d '\r\n' <"$d/enabled" 2>/dev/null)"
+            [ -z "$enabled" ] && enabled="unknown"
+        fi
+ 
         # Derive connector type from name: cardX-<TYPE>-N
-        # Strip "cardN-" prefix and trailing "-N" index.
         typ="$(printf '%s' "$name" \
             | sed -n 's/^card[0-9]\+-\([A-Za-z0-9+]\+\(-[A-Za-z0-9+]\+\)*\)-[0-9]\+/\1/p')"
         [ -z "$typ" ] && typ="unknown"
@@ -1442,22 +1517,27 @@ display_list_connectors() {
         # Modes
         modes_file="$d/modes"
         if [ -f "$modes_file" ]; then
-            # wc output can have spaces on BusyBox; trim
             mc="$(wc -l <"$modes_file" 2>/dev/null | tr -d '[:space:]')"
             [ -z "$mc" ] && mc=0
             fm="$(head -n 1 "$modes_file" 2>/dev/null | tr -d '\r\n')"
+            [ -z "$fm" ] && fm="<none>"
         else
             mc=0
-            fm=""
+            fm="<none>"
         fi
  
-        printf '%s\t%s\t%s\t%s\t%s\n' "$name" "$status" "$typ" "$mc" "$fm"
+        # Current mode (best-effort via debugfs helper)
+        cur="$(display_connector_cur_mode "$name")"
+        [ -z "$cur" ] && cur="-"
+ 
+        # NOTE: 7 columns: name status enabled typ mc fm cur
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "$name" "$status" "$enabled" "$typ" "$mc" "$fm" "$cur"
         found=1
     done
     [ "$found" -eq 1 ] || return 1
     return 0
 }
-
 # Return 0 if any connector is connected; else 1
 display_any_attached() {
     for d in /sys/class/drm/*-*; do
@@ -1539,84 +1619,18 @@ display_debug_snapshot() {
     ctx="$1"
     [ -z "$ctx" ] && ctx="display-snapshot"
     log_info "----- Display snapshot: $ctx -----"
-
-    # DRM nodes (no ls; iterate)
-    nodes=""
-    for f in /dev/dri/card* /dev/dri/renderD*; do
-        if [ -e "$f" ]; then
-            if [ -z "$nodes" ]; then nodes="$f"; else nodes="$nodes $f"; fi
-        fi
-    done
-    if [ -n "$nodes" ]; then
-        log_info "DRM nodes: $nodes"
-    else
-        log_warn "No /dev/dri/* nodes found."
-    fi
-
-    # Connectors
-    have=0
-    # shellcheck disable=SC2039
-    while IFS="$(printf '\t')" read -r name status typ mc fm; do
-        have=1
-        if [ -n "$fm" ]; then
-            log_info "DRM: ${name} status=${status} type=${typ} modes=${mc} first=${fm}"
-        else
-            log_info "DRM: ${name} status=${status} type=${typ} modes=${mc}"
-        fi
-    done <<EOF
-$(display_list_connectors 2>/dev/null || true)
-EOF
-    [ "$have" -eq 1 ] || log_warn "No DRM connectors in /sys/class/drm."
-
-    # Summary + weston outputs (if any)
-    sum="$(display_connected_summary 2>/dev/null || echo none)"
-    log_info "Connected summary: $sum"
-    display_weston_outputs | while IFS= read -r l; do
-        [ -n "$l" ] && log_info "$l"
-    done
-
-    log_info "----- End display snapshot: $ctx -----"
-}
-
-display_debug_snapshot() {
-    ctx="$1"
-    [ -z "$ctx" ] && ctx="display-snapshot"
-    log_info "----- Display snapshot: $ctx -----"
  
-    # DRM nodes
-    nodes=""
-    for f in /dev/dri/card* /dev/dri/renderD*; do
-        [ -e "$f" ] && nodes="${nodes:+$nodes }$f"
-    done
-    if [ -n "$nodes" ]; then
-        log_info "DRM nodes: $nodes"
-    else
-        log_warn "No /dev/dri/* nodes found."
-    fi
- 
-    # Sysfs connectors (expects display_list_connectors to print tab-separated fields)
     have=0
-    while IFS="$(printf '\t')" read -r name status typ mc fm; do
+    while IFS="$(printf '\t')" read -r name status enabled typ mc fm cur; do
         [ -n "$name" ] || continue
         have=1
-        if [ -n "$fm" ]; then
-            log_info "DRM: ${name} status=${status} type=${typ} modes=${mc} first=${fm}"
-        else
-            log_info "DRM: ${name} status=${status} type=${typ} modes=${mc}"
-        fi
+        [ -z "$fm" ] && fm="<none>"
+        [ -z "$cur" ] && cur="-"
+        log_info "DRM: ${name} status=${status} enabled=${enabled} type=${typ} modes=${mc} first=${fm} cur=${cur}"
     done <<EOF
 $(display_list_connectors 2>/dev/null || true)
 EOF
     [ "$have" -eq 1 ] || log_warn "No DRM connectors in /sys/class/drm."
- 
-    # Connected summary (sysfs)
-    sum="$(display_connected_summary 2>/dev/null || echo none)"
-    log_info "Connected summary (sysfs): $sum"
- 
-    # Optional weston outputs (existing helper)
-    display_weston_outputs | while IFS= read -r l; do
-        [ -n "$l" ] && log_info "$l"
-    done
  
     log_info "----- End display snapshot: $ctx -----"
 }
