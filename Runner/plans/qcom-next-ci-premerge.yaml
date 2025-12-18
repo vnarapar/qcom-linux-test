@@ -11,11 +11,15 @@ metadata:
     devices:
         - rb3gen2
 
+
+env:
+    SSID: ${{ secrets.SSID }}
+    PASSWORD: ${{ secrets.SSID }}
+
+
 run:
     steps:
-        - SSID: ${{ secrets.SSID }}
-        - PASSWORD: ${{ secrets.SSID }}
         - cd Runner
-        - $PWD/suites/Connectivity/WiFi/WiFi_Manual_IP/run.sh || true
+        - $PWD/suites/Connectivity/WiFi/WiFi_Manual_IP/run.sh --ssid ${SSID} --password ${PASSWORD} || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/WiFi/WiFi_Manual_IP/WiFi_Manual_IP.res || true
         - $PWD/utils/result_parse.sh
