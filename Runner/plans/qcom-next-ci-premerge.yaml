@@ -18,9 +18,13 @@ env:
 
 
 run:
+    env:
+        SSID: ${{ secrets.SSID }}
+        PASSWORD: ${{ secrets.SSID }}
     steps:
         - cd Runner
         - echo ${SSID}
+        - echo ${PASSWORD}
         - $PWD/suites/Connectivity/WiFi/WiFi_Manual_IP/run.sh --ssid ${SSID} --password ${PASSWORD} || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/WiFi/WiFi_Manual_IP/WiFi_Manual_IP.res || true
         - $PWD/utils/result_parse.sh
