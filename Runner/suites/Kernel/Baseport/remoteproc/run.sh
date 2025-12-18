@@ -41,11 +41,13 @@ log_info "=== Test Initialization ==="
 
 log_info "Getting the number of subsystems aavailable"
 
+detect_platform
+
 available_rprocs=$(cat /sys/class/remoteproc/remoteproc*/firmware)
 
 # Check if any line contains "modem"
 echo "$available_rprocs" | grep -q "modem"
-if [ $? -eq 0 ]; then
+if [ $? -eq 0 ] && [ ${PLATFORM_TARGET} = "Kodiak" ]; then
     subsystem_count=$(echo "$available_rprocs" | grep -v "modem" | wc -l)
 else
     # "modem" not found, count all lines
