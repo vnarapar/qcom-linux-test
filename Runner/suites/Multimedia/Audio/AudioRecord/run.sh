@@ -84,7 +84,7 @@ while [ $# -gt 0 ]; do
       DURATIONS="$2"
       shift 2
       ;;
-    --rec-secs)
+    --rec-secs|--record-seconds)
       REC_SECS="$2"
       shift 2
       ;;
@@ -97,8 +97,16 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     --strict)
-      STRICT=1
-      shift
+      case "$2" in
+        --*|"")
+          STRICT=1
+          shift
+          ;;
+        *)
+          STRICT="$2"
+          shift 2
+          ;;
+      esac
       ;;
     --no-dmesg)
       DMESG_SCAN=0
