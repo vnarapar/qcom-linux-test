@@ -67,6 +67,8 @@ STRICT="${STRICT:-0}"
 DMESG_SCAN="${DMESG_SCAN:-1}"
 VERBOSE=0
 EXTRACT_AUDIO_ASSETS="${EXTRACT_AUDIO_ASSETS:-true}"
+ENABLE_NETWORK_DOWNLOAD="${ENABLE_NETWORK_DOWNLOAD:-false}" # Default: no network operations
+AUDIO_CLIPS_BASE_DIR="${AUDIO_CLIPS_BASE_DIR:-}" # Custom path for audio clips (CI use)
 
 # Network bring-up knobs (match video behavior)
 if [ -z "${NET_STABILIZE_SLEEP:-}" ]; then
@@ -88,6 +90,8 @@ Usage: $0 [options]
   --durations "short|short medium|short medium long"
   --loops N
   --timeout SECS # set 0 to disable watchdog
+  --enable-network-download
+  --audio-clips-path PATH # Custom location for audio clips (CI use)
   --strict
   --no-dmesg
   --no-extract-assets
@@ -136,6 +140,14 @@ while [ $# -gt 0 ]; do
       EXTRACT_AUDIO_ASSETS=false
       shift
       ;;
+    --enable-network-download)
+      ENABLE_NETWORK_DOWNLOAD=true
+      shift
+      ;;
+    --audio-clips-path)
+      AUDIO_CLIPS_BASE_DIR="$2"
+      shift 2
+      ;;
     --ssid)
       # shellcheck disable=SC2034
       SSID="$2"
@@ -161,6 +173,12 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Auto-enable network download if WiFi credentials provided
+if [ -n "$SSID" ] && [ -n "$PASSWORD" ]; then
+  log_info "WiFi credentials provided, auto-enabling network download"
+  ENABLE_NETWORK_DOWNLOAD=true
+fi
+
 # Ensure we run from the testcase dir
 test_path="$(find_test_case_by_name "$TESTNAME" 2>/dev/null || echo "$SCRIPT_DIR")"
 if ! cd "$test_path"; then
@@ -178,7 +196,13 @@ else
   log_info "Platform Details: unknown"
 fi
 
-log_info "Args: backend=${AUDIO_BACKEND:-auto} sink=$SINK_CHOICE loops=$LOOPS timeout=$TIMEOUT formats='$FORMATS' durations='$DURATIONS' strict=$STRICT dmesg=$DMESG_SCAN extract=$EXTRACT_AUDIO_ASSETS"
+# Export AUDIO_CLIPS_BASE_DIR for use by resolve_clip() in audio_common.sh
+if [ -n "$AUDIO_CLIPS_BASE_DIR" ]; then
+  export AUDIO_CLIPS_BASE_DIR
+  log_info "Using custom audio clips path: $AUDIO_CLIPS_BASE_DIR"
+fi
+
+log_info "Args: backend=${AUDIO_BACKEND:-auto} sink=$SINK_CHOICE loops=$LOOPS timeout=$TIMEOUT formats='$FORMATS' durations='$DURATIONS' strict=$STRICT dmesg=$DMESG_SCAN extract=$EXTRACT_AUDIO_ASSETS network_download=$ENABLE_NETWORK_DOWNLOAD clips_path=${AUDIO_CLIPS_BASE_DIR:-default}"
 
 # --- Rootfs minimum size check (mirror video policy) ---
 if [ "$TOP_LEVEL_RUN" -eq 1 ]; then
@@ -187,25 +211,51 @@ else
   log_info "Sub-run: skipping rootfs size check (already performed)."
 fi
 
-# --- Network preflight identical to video gating ---
+# --- Smart network gating: only connect if needed ---
 if [ "$TOP_LEVEL_RUN" -eq 1 ]; then
   if [ "${EXTRACT_AUDIO_ASSETS}" = "true" ]; then
-    NET_RC="1"
-
-    if command -v check_network_status_rc >/dev/null 2>&1; then
-      check_network_status_rc
-      NET_RC="$?"
-    elif command -v check_network_status >/dev/null 2>&1; then
-      check_network_status >/dev/null 2>&1
-      NET_RC="$?"
-    fi
-
-    if [ "$NET_RC" -ne 0 ]; then
-      video_step "" "Bring network online (Wi-Fi credentials if provided)"
-      ensure_network_online || true
-      sleep "${NET_STABILIZE_SLEEP}"
+    # First check: Do we have all files we need?
+    if audio_check_clips_available "$FORMATS" "$DURATIONS"; then
+      log_info "All required audio clips present locally, skipping all network operations"
     else
-      sleep "${NET_STABILIZE_SLEEP}"
+      # Files missing - check if network download is enabled
+      if [ "${ENABLE_NETWORK_DOWNLOAD}" = "true" ]; then
+        log_info "Audio clips missing, network download enabled - bringing network online"
+        # Now check network status and bring up if needed
+        NET_RC="1"
+        if command -v check_network_status_rc >/dev/null 2>&1; then
+          check_network_status_rc
+          NET_RC="$?"
+        elif command -v check_network_status >/dev/null 2>&1; then
+          check_network_status >/dev/null 2>&1
+          NET_RC="$?"
+        fi
+
+        if [ "$NET_RC" -ne 0 ]; then
+          video_step "" "Bring network online (Wi-Fi credentials if provided)"
+          ensure_network_online || true
+          sleep "${NET_STABILIZE_SLEEP}"
+        else
+          sleep "${NET_STABILIZE_SLEEP}"
+        fi
+        
+        # Download and extract audio clips tarball
+        log_info "Downloading audio clips from: $AUDIO_TAR_URL"
+        if audio_fetch_assets_from_url "$AUDIO_TAR_URL"; then
+          log_info "Audio clips downloaded and extracted successfully"
+        else
+          log_error "Failed to download or extract audio clips from: $AUDIO_TAR_URL"
+          log_skip "$TESTNAME SKIP - Audio clips download failed"
+          echo "$TESTNAME SKIP" >"$RES_FILE"
+          exit 0
+        fi
+      else
+        log_skip "$TESTNAME SKIP - Required audio clips not found locally and network download disabled"
+        log_info "To download audio clips, run with: --enable-network-download"
+        log_info "Or manually download from: $AUDIO_TAR_URL"
+        echo "$TESTNAME SKIP" >"$RES_FILE"
+        exit 0
+      fi
     fi
   fi
 else
@@ -323,28 +373,22 @@ for fmt in $FORMATS; do
       continue
     fi
 
+    # Check if clip is available (should have been downloaded at top level if needed)
     if [ "${EXTRACT_AUDIO_ASSETS}" = "true" ]; then
-      if [ -f "$clip" ] && [ -s "$clip" ]; then
+      if [ -s "$clip" ]; then
         CLIP_BYTES="$(wc -c < "$clip" 2>/dev/null || echo 0)"
-        log_info "[$case_name] Clip already present: $clip (${CLIP_BYTES} bytes) — skipping fetch/extract."
+        log_info "[$case_name] Using clip: $clip (${CLIP_BYTES} bytes)"
       else
-        log_info "[$case_name] Preparing assets for clip: $clip (not found locally)"
-        log_info "[$case_name] Attempting fetch/extract from: $AUDIO_TAR_URL"
-
-        audio_ensure_clip_ready "$clip" "$AUDIO_TAR_URL"
-        rc=$?
-
-        if [ "$rc" -eq 0 ] && [ -f "$clip" ]; then
-          CLIP_BYTES="$(wc -c < "$clip" 2>/dev/null || echo 0)"
-          log_info "[$case_name] Clip ready: $clip (${CLIP_BYTES} bytes)"
+        # Clip missing or empty - this shouldn't happen if top-level download succeeded
+        log_skip "[$case_name] SKIP: Clip not available: $clip"
+        if [ "${ENABLE_NETWORK_DOWNLOAD}" = "true" ]; then
+          log_info "[$case_name] Hint: Clip should have been downloaded at test startup"
+        else
+          log_info "[$case_name] Hint: Run with --enable-network-download to download clips"
         fi
-
-        if [ "$rc" -eq 2 ] || [ "$rc" -eq 1 ]; then
-          log_skip "[$case_name] SKIP: Required clip missing and network unavailable or fetch failed."
-          echo "$case_name SKIP (clip missing)" >> "$LOGDIR/summary.txt"
-          skip=$((skip + 1))
-          continue
-        fi
+        echo "$case_name SKIP (clip unavailable)" >> "$LOGDIR/summary.txt"
+        skip=$((skip + 1))
+        continue
       fi
     fi
 

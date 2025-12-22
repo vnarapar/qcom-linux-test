@@ -9,6 +9,7 @@ This suite automates the validation of audio playback capabilities on Qualcomm L
 
 - Supports **PipeWire** and **PulseAudio** backends
 - Plays audio clips with configurable format, duration, and loop count
+- **Network operations are optional**: By default, no network connection is attempted. Use `--enable-network-download` to enable downloading missing audio files
 - Automatically downloads and extracts audio assets if missing
 - Validates playback using multiple evidence sources:
   - PipeWire/PulseAudio streaming state
@@ -91,6 +92,23 @@ SSID="MyNetwork" PASSWORD="MyPassword" ./run-test.sh AudioPlayback
 # Override network probe targets (useful in restricted networks)
 NET_PROBE_ROUTE_IP=192.168.1.1 NET_PING_HOST=192.168.1.254 ./run-test.sh AudioPlayback
 
+# Run without network (requires local clips)
+./run.sh
+
+# Enable network download for missing clips
+./run.sh --enable-network-download
+
+# Provide WiFi credentials (auto-enables download)
+./run.sh --ssid "MyNetwork" --password "MyPassword"
+
+# Offline mode with local clips only
+./run.sh --no-extract-assets
+
+# CI workflow: Use pre-staged clips at custom location
+./run.sh --audio-clips-path /tmp/ci-audio-staging/AudioClips
+
+# CI workflow: Via environment variable
+AUDIO_CLIPS_BASE_DIR="/tmp/ci-audio-staging/AudioClips" ./run-test.sh AudioPlayback
 
 **Directly from Test Directory**
 cd Runner/suites/Multimedia/Audio/AudioPlayback
@@ -112,38 +130,42 @@ cd Runner/suites/Multimedia/Audio/AudioPlayback
 
 
 Environment Variables:
-Variable	          Description	                                 Default
-AUDIO_BACKEND	      Selects backend: pipewire or pulseaudio	     auto-detect
-SINK_CHOICE	          Playback sink: speakers or null	             speakers
-FORMATS	              Audio formats: e.g. wav	                     wav
-DURATIONS	          Playback durations: short, medium, long	     short
-LOOPS	              Number of playback loops	                     1
-TIMEOUT	              Playback timeout per loop (e.g., 15s, 0=none)	 0
-STRICT	              Enable strict mode (fail on any error)	     0
-DMESG_SCAN	          Scan dmesg for errors after playback	         1
-VERBOSE	              Enable verbose logging	                     0
-EXTRACT_AUDIO_ASSETS  Download/extract audio assets if missing	     true
-JUNIT_OUT	          Path to write JUnit XML output	             unset
-SSID                  Wi-Fi SSID for network connection              unset
-PASSWORD              Wi-Fi password for network connection          unset
-NET_PROBE_ROUTE_IP    IP used for route probing (default: 1.1.1.1)   1.1.1.1
-NET_PING_HOST         Host used for ping reachability check          8.8.8.8
+Variable	             Description	                                 Default
+AUDIO_BACKEND	         Selects backend: pipewire or pulseaudio	     auto-detect
+SINK_CHOICE	             Playback sink: speakers or null	             speakers
+FORMATS	                 Audio formats: e.g. wav	                     wav
+DURATIONS	             Playback durations: short, medium, long	     short
+LOOPS	                 Number of playback loops	                     1
+TIMEOUT	                 Playback timeout per loop (e.g., 15s, 0=none)	 0
+STRICT	                 Enable strict mode (fail on any error)	         0
+DMESG_SCAN	             Scan dmesg for errors after playback	         1
+VERBOSE	                 Enable verbose logging	                         0
+EXTRACT_AUDIO_ASSETS     Download/extract audio assets if missing	     true
+ENABLE_NETWORK_DOWNLOAD  Enable network download of missing audio files  false
+AUDIO_CLIPS_BASE_DIR     Custom path to pre-staged audio clips (CI use)  unset
+JUNIT_OUT	             Path to write JUnit XML output	                 unset
+SSID                     Wi-Fi SSID for network connection               unset
+PASSWORD                 Wi-Fi password for network connection           unset
+NET_PROBE_ROUTE_IP       IP used for route probing (default: 1.1.1.1)    1.1.1.1
+NET_PING_HOST            Host used for ping reachability check           8.8.8.8
 
 
 CLI Options
-Option	              Description
---backend	          Select backend: pipewire or pulseaudio
---sink	              Playback sink: speakers or null
---formats	          Audio formats (space/comma separated): e.g. wav
---durations	          Playback durations: short, medium, long
---loops	              Number of playback loops
---timeout	          Playback timeout per loop (e.g., 15s)
---strict	          Enable strict mode
---no-dmesg	          Disable dmesg scan
---no-extract-assets	  Disable asset extraction
---junit <file.xml>	  Write JUnit XML output
---verbose	          Enable verbose logging
---help	              Show usage instructions
+Option	                    Description
+--backend	                Select backend: pipewire or pulseaudio
+--sink	                    Playback sink: speakers or null
+--formats	                Audio formats (space/comma separated): e.g. wav
+--durations	                Playback durations: short, medium, long
+--loops	                    Number of playback loops
+--timeout	                Playback timeout per loop (e.g., 15s)
+--strict	                Enable strict mode
+--no-dmesg	                Disable dmesg scan
+--no-extract-assets         Disable asset extraction entirely (skips all asset operations)
+--enable-network-download   Enable network operations to download missing audio files (default: disabled)
+--audio-clips-path <path>   Custom location for audio clips (for CI with pre-staged clips)
+--junit <file.xml>	        Write JUnit XML output
+--verbose	                Enable verbose logging
+--help	                    Show usage instructions
 
 ```
 
@@ -178,8 +200,10 @@ Diagnostic logs: dmesg snapshots, mixer dumps, playback logs per test case
 - The script validates the presence of required tools before executing tests; missing tools result in SKIP.
 - If any critical tool is missing, the script exits with an error message.
 - Logs include dmesg snapshots, mixer dumps, and playback logs.
-- Asset download requires network connectivity.
-- Pass Wi-Fi credentials via SSID and PASSWORD environment variables to enable network access for asset downloads and playback validation.
+- **Network operations are disabled by default**. Use `--enable-network-download` to download missing audio files.
+- Pass Wi-Fi credentials via `--ssid` and `--password` CLI flags (or SSID/PASSWORD environment variables) to auto-enable network download.
+- If audio clips are present locally, the test runs without any network operations (offline-capable).
+- If clips are missing and network download is disabled, the test will SKIP with a helpful message.
 - You can override default network probe targets using NET_PROBE_ROUTE_IP and NET_PING_HOST to avoid connectivity-related failures in restricted environments.
 - Evidence-based PASS/FAIL logic ensures reliability even if backend quirks occur.
 
@@ -187,4 +211,5 @@ Diagnostic logs: dmesg snapshots, mixer dumps, playback logs per test case
 
 SPDX-License-Identifier: BSD-3-Clause-Clear  
 (C) Qualcomm Technologies, Inc. and/or its subsidiaries.
+
 

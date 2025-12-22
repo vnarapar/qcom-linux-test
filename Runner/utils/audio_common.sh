@@ -30,7 +30,8 @@ check_audio_daemon() {
 
 # ---------- Assets / clips ----------
 resolve_clip() {
-  fmt="$1"; dur="$2"; base="AudioClips"
+  fmt="$1"; dur="$2"
+  base="${AUDIO_CLIPS_BASE_DIR:-AudioClips}"
   case "$fmt:$dur" in
     wav:short|wav:medium|wav:long) printf '%s\n' "$base/yesterday_48KHz.wav" ;;
     *) printf '%s\n' "" ;;
@@ -734,4 +735,23 @@ alsa_pick_virtual_pcm() {
     fi
   done
   return 1
+}
+
+
+# Check if all required audio clips are available locally
+# Usage: audio_check_clips_available "$FORMATS" "$DURATIONS"
+# Returns: 0 if all clips present and non-empty, 1 if any clip missing or empty
+audio_check_clips_available() {
+  formats="$1"
+  durations="$2"
+  
+  for fmt in $formats; do
+    for dur in $durations; do
+      clip="$(resolve_clip "$fmt" "$dur")"
+      if [ -n "$clip" ] && [ ! -s "$clip" ]; then
+        return 1  # At least one clip missing or empty
+      fi
+    done
+  done
+  return 0  # All clips present and non-empty
 }
