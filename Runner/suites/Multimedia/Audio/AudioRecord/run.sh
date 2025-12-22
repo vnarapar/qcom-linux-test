@@ -44,8 +44,8 @@ mkdir -p "$LOGDIR"
 # ---------------- Defaults / CLI ----------------
 AUDIO_BACKEND=""
 SRC_CHOICE="${SRC_CHOICE:-mic}" # mic|null
-DURATIONS="${DURATIONS:-short}" # label set OR numeric tokens when REC_SECS=auto
-REC_SECS="${REC_SECS:-30s}" # DEFAULT: 30s; 'auto' maps short/med/long
+DURATIONS="${DURATIONS:-short}" # label set OR numeric tokens when RECORD_SECONDS=auto
+RECORD_SECONDS="${RECORD_SECONDS:-30s}" # DEFAULT: 30s; 'auto' maps short/med/long
 LOOPS="${LOOPS:-1}"
 TIMEOUT="${TIMEOUT:-0}" # 0 = no watchdog
 STRICT="${STRICT:-0}"
@@ -58,11 +58,11 @@ usage() {
 Usage: $0 [options]
   --backend {pipewire|pulseaudio}
   --source {mic|null}
-  --rec-secs SECS|auto (default: 30s; 'auto' maps short=5s, medium=15s, long=30s)
-  --durations "short [medium] [long] [10s] [35secs]" (used when --rec-secs auto)
+  --record-seconds SECS|auto (default: 30s; 'auto' maps short=5s, medium=15s, long=30s)
+  --durations "short [medium] [long] [10s] [35secs]" (used when --record-seconds auto)
   --loops N
   --timeout SECS
-  --strict
+  --strict [0|1]
   --no-dmesg
   --junit FILE.xml
   --verbose
@@ -84,8 +84,8 @@ while [ $# -gt 0 ]; do
       DURATIONS="$2"
       shift 2
       ;;
-    --rec-secs|--record-seconds)
-      REC_SECS="$2"
+    --record-seconds)
+      RECORD_SECONDS="$2"
       shift 2
       ;;
     --loops)
@@ -148,7 +148,7 @@ else
   log_info "Platform Details: unknown"
 fi
 
-log_info "Args: backend=${AUDIO_BACKEND:-auto} source=$SRC_CHOICE loops=$LOOPS durations='$DURATIONS' rec_secs=$REC_SECS timeout=$TIMEOUT strict=$STRICT dmesg=$DMESG_SCAN"
+log_info "Args: backend=${AUDIO_BACKEND:-auto} source=$SRC_CHOICE loops=$LOOPS durations='$DURATIONS' record_seconds=$RECORD_SECONDS timeout=$TIMEOUT strict=$STRICT dmesg=$DMESG_SCAN"
 
 # Resolve backend
 if [ -z "$AUDIO_BACKEND" ]; then
@@ -364,7 +364,7 @@ append_junit() {
   } >> "$JUNIT_TMP"
 }
 
-# Auto map if REC_SECS=auto, and accept numeric tokens like 35s/35sec/35secs/35seconds
+# Auto map if RECORD_SECONDS=auto, and accept numeric tokens like 35s/35sec/35secs/35seconds
 auto_secs_for() {
   case "$1" in
     short) echo "5s" ;;
@@ -405,7 +405,7 @@ for dur in $DURATIONS; do
   : > "$logf"
   export AUDIO_LOGCTX="$logf"
 
-  secs="$REC_SECS"
+  secs="$RECORD_SECONDS"
   if [ "$secs" = "auto" ]; then
     tok="$(printf '%s' "$dur" | tr '[:upper:]' '[:lower:]')"
     tok_secs="$(printf '%s' "$tok" | sed -n 's/^\([0-9][0-9]*\)\(s\|sec\|secs\|seconds\)$/\1s/p')"

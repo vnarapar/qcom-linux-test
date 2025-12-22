@@ -101,10 +101,10 @@ Variable	      Description	                                   Default
 AUDIO_BACKEND	  Selects backend: pipewire or pulseaudio	       auto-detect
 SOURCE_CHOICE	  Recording source: mic or null	                   mic
 DURATIONS	      Recording durations: short, medium, long	       short
-RECORD_SECONDS	  Number of seconds to record (numeric or mapped)  5
+RECORD_SECONDS	  Number of seconds to record (numeric or mapped), default: 30s  30
 LOOPS	          Number of recording loops	                       1
 TIMEOUT	          Recording timeout per loop (e.g., 15s, 0=none)   0
-STRICT	          Enable strict mode (fail on any error)	       0
+STRICT	          Strict mode (0=disabled, 1=enabled, fail on any error)	       0
 DMESG_SCAN	      Scan dmesg for errors after recording	           1
 VERBOSE	          Enable verbose logging	                       0
 JUNIT_OUT	      Path to write JUnit XML output	               unset
@@ -118,7 +118,7 @@ Option	          Description
 --record-seconds  Number of seconds to record (numeric or mapped)
 --loops	          Number of recording loops
 --timeout	      Recording timeout per loop (e.g., 15s)
---strict	      Enable strict mode
+--strict [0|1]    Enable strict mode (0=disabled, 1=enabled)
 --no-dmesg	      Disable dmesg scan
 --junit<file.xml> Write JUnit XML output
 --verbose	      Enable verbose logging
@@ -130,7 +130,7 @@ Sample Output:
 sh-5.2# ./run.sh --backend pipewire
 [INFO] 2025-09-12 06:06:04 - ---------------- Starting AudioRecord ----------------
 [INFO] 2025-09-12 06:06:04 - SoC: 498
-[INFO] 2025-09-12 06:06:04 - Args: backend=pipewire source=mic loops=1 durations='short' rec_secs=30s timeout=0 strict=0 dmesg=1
+[INFO] 2025-09-12 06:06:04 - Args: backend=pipewire source=mic loops=1 durations='short' record_seconds=30s timeout=0 strict=0 dmesg=1
 [INFO] 2025-09-12 06:06:04 - Using backend: pipewire
 [INFO] 2025-09-12 06:06:04 - Routing to source: id/name=48 label='pal source handset mic' choice=mic
 [INFO] 2025-09-12 06:06:04 - Watchdog/timeout: 0
@@ -163,4 +163,3 @@ Results:
 
 SPDX-License-Identifier: BSD-3-Clause-Clear  
 (C) Qualcomm Technologies, Inc. and/or its subsidiaries.
-
