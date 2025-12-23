@@ -1789,37 +1789,469 @@ run_dhcp_client() {
 
 # Safely run DHCP client without disrupting existing config
 try_dhcp_client_safe() {
-    iface="$1"
-    timeout="${2:-10}"
-
+    iface=$1
+    timeout=${2:-10}
+ 
+    [ -n "$iface" ] || return 1
+ 
+    # Debug breadcrumb: track which path we took
+    dhcp_path="unknown"
+    dhcp_note=""
+ 
+    # Ensure interface is up (best-effort)
+    ip link set "$iface" up >/dev/null 2>&1 || true
+ 
+    # If link is down/no cable, don't try DHCP
+    if command -v is_link_up >/dev/null 2>&1; then
+        if ! is_link_up "$iface"; then
+            log_warn "$iface link is down; skipping DHCP"
+            return 1
+        fi
+    elif command -v ethIsLinkUp >/dev/null 2>&1; then
+        if ! ethIsLinkUp "$iface"; then
+            log_warn "$iface link is down; skipping DHCP"
+            return 1
+        fi
+    fi
+ 
     current_ip=$(get_ip_address "$iface")
     if [ -n "$current_ip" ] && ! echo "$current_ip" | grep -q '^169\.254'; then
+        dhcp_path="skip_existing_ip"
+        log_info "$iface DHCP path: ${dhcp_path} (ip=${current_ip})"
         log_info "$iface already has valid IP: $current_ip. Skipping DHCP."
         return 0
     fi
-
+ 
+    # If NetworkManager/systemd-networkd is active, avoid fighting it:
+    # just wait for IP to appear.
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl is-active --quiet NetworkManager 2>/dev/null \
+           || systemctl is-active --quiet systemd-networkd 2>/dev/null; then
+            dhcp_path="systemd_nm_wait"
+            log_info "$iface DHCP path: ${dhcp_path} (timeout=${timeout}s)"
+            log_info "Network manager detected; waiting up to ${timeout}s for IP on $iface..."
+            i=0
+            while [ "$i" -lt "$timeout" ]; do
+                current_ip=$(get_ip_address "$iface")
+                if [ -n "$current_ip" ] && ! echo "$current_ip" | grep -q '^169\.254'; then
+                    log_info "$iface obtained IP via network manager: $current_ip"
+                    log_info "$iface DHCP path: ${dhcp_path} success (ip=${current_ip})"
+                    return 0
+                fi
+                i=$((i + 1))
+                sleep 1
+            done
+            log_warn "$iface did not obtain a valid IP within ${timeout}s"
+            log_warn "$iface DHCP path: ${dhcp_path} failed (no valid IP within ${timeout}s)"
+            return 1
+        fi
+    fi
+ 
+    # Minimal/kernel-only builds might not have udhcpc. Try other clients first if needed.
     if ! command -v udhcpc >/dev/null 2>&1; then
-        log_warn "udhcpc not found, skipping DHCP attempt"
+        log_warn "udhcpc not found (kernel/minimal build). Trying fallback DHCP clients..."
+        dhcp_path="fallback_clients"
+        log_info "$iface DHCP path: ${dhcp_path} (trying dhclient/dhcpcd)"
+ 
+        if command -v dhclient >/dev/null 2>&1; then
+            dhcp_note="dhclient"
+            log_info "$iface DHCP path: ${dhcp_path}/${dhcp_note} (timeout=${timeout}s)"
+            # Best-effort: try bounded dhclient
+            if command -v run_with_timeout >/dev/null 2>&1; then
+                run_with_timeout "${timeout}s" dhclient -1 -v "$iface" >/dev/null 2>&1 || true
+            else
+                dhclient -1 -v "$iface" >/dev/null 2>&1 || true
+            fi
+ 
+            current_ip=$(get_ip_address "$iface")
+            if [ -n "$current_ip" ] && ! echo "$current_ip" | grep -q '^169\.254'; then
+                log_info "$iface DHCP path: ${dhcp_path}/${dhcp_note} success (ip=${current_ip})"
+                return 0
+            fi
+        fi
+ 
+        if command -v dhcpcd >/dev/null 2>&1; then
+            dhcp_note="dhcpcd"
+            log_info "$iface DHCP path: ${dhcp_path}/${dhcp_note} (timeout=${timeout}s)"
+            # dhcpcd: try a bounded attempt and then stop
+            if command -v run_with_timeout >/dev/null 2>&1; then
+                run_with_timeout "${timeout}s" dhcpcd -4 -t "$timeout" "$iface" >/dev/null 2>&1 || true
+            else
+                dhcpcd -4 -t "$timeout" "$iface" >/dev/null 2>&1 || true
+            fi
+            # Avoid leaving daemon running if it spawned
+            dhcpcd -k "$iface" >/dev/null 2>&1 || true
+ 
+            current_ip=$(get_ip_address "$iface")
+            if [ -n "$current_ip" ] && ! echo "$current_ip" | grep -q '^169\.254'; then
+                log_info "$iface DHCP path: ${dhcp_path}/${dhcp_note} success (ip=${current_ip})"
+                return 0
+            fi
+        fi
+ 
+        log_warn "$iface DHCP path: ${dhcp_path} failed (no client succeeded)"
+        return 1
+    fi
+ 
+    # Safe udhcpc script:
+    # - Avoid aggressive flushes
+    # - Remove only link-local (169.254/16) if present
+    # - Apply lease IP/route
+    safe_dhcp_script=$(mktemp /tmp/udhcpc-safe-"$iface".XXXXXX 2>/dev/null || echo "/tmp/udhcpc-safe-$iface-$$.sh")
+    cat <<'EOF' > "$safe_dhcp_script"
+#!/bin/sh
+# udhcpc env: interface ip subnet mask router dns ...
+mask_to_prefix() {
+    m="$1"
+    case "$m" in
+        *.*.*.*)
+            echo "$m" | awk -F. '
+            function bits8(n,  b) {
+                b=0
+                while (n>0) { b += (n%2); n=int(n/2) }
+                return b
+            }
+            {
+                p=0
+                for (i=1; i<=4; i++) {
+                    n=$i+0
+                    # count bits set in each octet (valid for contiguous netmasks)
+                    if      (n==255) p+=8
+                    else if (n==254) p+=7
+                    else if (n==252) p+=6
+                    else if (n==248) p+=5
+                    else if (n==240) p+=4
+                    else if (n==224) p+=3
+                    else if (n==192) p+=2
+                    else if (n==128) p+=1
+                    else if (n==0)   p+=0
+                    else { p="" ; break }
+                }
+                if (p!="") print p
+            }'
+            ;;
+        *)
+            case "$m" in
+                ''|*[!0-9]*) echo "" ;;
+                *) echo "$m" ;;
+            esac
+            ;;
+    esac
+}
+ 
+case "$1" in
+    bound|renew)
+        # Drop link-local if present
+        ip -4 addr show dev "$interface" 2>/dev/null | awk '/inet 169\.254\./{print $2}' \
+        | while IFS= read -r cidr; do
+            [ -n "$cidr" ] || continue
+            ip addr del "$cidr" dev "$interface" >/dev/null 2>&1 || true
+        done
+ 
+        # Add/replace address (best-effort)
+        if [ -n "$ip" ]; then
+            pfx=""
+            if [ -n "$mask" ]; then
+                pfx=$(mask_to_prefix "$mask" 2>/dev/null)
+            fi
+            if [ -n "$pfx" ]; then
+                ip addr replace "$ip/$pfx" dev "$interface" >/dev/null 2>&1 || true
+            else
+                ip addr add "$ip" dev "$interface" >/dev/null 2>&1 || true
+            fi
+        fi
+ 
+        # Default route
+        if [ -n "$router" ]; then
+            ip route replace default via "$router" dev "$interface" >/dev/null 2>&1 || true
+        fi
+        exit 0
+        ;;
+    deconfig)
+        # Do nothing (avoid flushing)
+        exit 0
+        ;;
+    *)
+        exit 0
+        ;;
+esac
+EOF
+    chmod +x "$safe_dhcp_script"
+ 
+    dhcp_path="udhcpc_safe_script"
+    log_info "$iface DHCP path: ${dhcp_path} (timeout=${timeout}s)"
+    log_info "Attempting DHCP on $iface (udhcpc) for up to ${timeout}s..."
+    if command -v run_with_timeout >/dev/null 2>&1; then
+        run_with_timeout "${timeout}s" udhcpc -i "$iface" -n -q -s "$safe_dhcp_script" >/dev/null 2>&1 || true
+    else
+        # Best-effort bounded retries if run_with_timeout isn't available
+        udhcpc -i "$iface" -n -q -t 3 -T 3 -s "$safe_dhcp_script" >/dev/null 2>&1 || true
+    fi
+ 
+    rm -f "$safe_dhcp_script" >/dev/null 2>&1 || true
+ 
+    # Verify outcome
+    current_ip=$(get_ip_address "$iface")
+    if [ -n "$current_ip" ] && ! echo "$current_ip" | grep -q '^169\.254'; then
+        log_info "$iface obtained IP after DHCP: $current_ip"
+        log_info "$iface DHCP path: ${dhcp_path} success (ip=${current_ip})"
+        return 0
+    fi
+ 
+    log_warn "$iface still has no valid IP after DHCP attempt"
+    log_warn "$iface DHCP path: ${dhcp_path} failed (no valid IP after attempt)"
+    return 1
+}
+
+ethLinkDetected() {
+    iface=$1
+    [ -n "$iface" ] || return 1
+
+    command -v ethtool >/dev/null 2>&1 || return 1
+    # Prints: yes/no (or nothing on parse failure)
+    ethtool "$iface" 2>/dev/null \
+        | awk -F': ' '/^[[:space:]]*Link detected:/ {print $2; exit 0}'
+}
+
+ethIsLinkUp() {
+    iface=$1
+    [ -n "$iface" ] || return 1
+ 
+    # 1) If carrier says 1, we are good (fast path)
+    if [ -r "/sys/class/net/$iface/carrier" ]; then
+        [ "$(cat "/sys/class/net/$iface/carrier" 2>/dev/null)" = "1" ] && return 0
+        # If carrier is 0, do NOT return yet — fall through to other hints.
+    fi
+ 
+    # 2) If helper exists and says up, accept it (but don't fail early)
+    if command -v is_link_up >/dev/null 2>&1; then
+        is_link_up "$iface" && return 0
+    fi
+ 
+    # 3) operstate can sometimes reflect link sooner than carrier in some stacks
+    if [ -r "/sys/class/net/$iface/operstate" ]; then
+        st=$(cat "/sys/class/net/$iface/operstate" 2>/dev/null || true)
+        [ "$st" = "up" ] && return 0
+    fi
+ 
+    # 4) ip link LOWER_UP (physical) is a good signal if ip exists
+    if command -v ip >/dev/null 2>&1; then
+        ip link show "$iface" 2>/dev/null | grep -qw "LOWER_UP" && return 0
+    fi
+ 
+    # 5) Last resort: ethtool parse
+    if command -v ethtool >/dev/null 2>&1; then
+        ld=$(ethtool "$iface" 2>/dev/null | awk -F': ' '/^[[:space:]]*Link detected:/ {print $2; exit 0}' || true)
+        [ "$ld" = "yes" ] && return 0
+    fi
+ 
+    return 1
+}
+ 
+ethWaitLinkUp() {
+    iface=$1
+    timeout_s=$2
+    i=0
+ 
+    [ -n "$iface" ] || return 1
+    [ -n "$timeout_s" ] || timeout_s=5
+ 
+    while [ "$i" -lt "$timeout_s" ]; do
+        if ethIsLinkUp "$iface"; then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 1
+    done
+ 
+    return 1
+}
+
+ethGetLinkSpeedMbps() {
+    iface=$1
+    sp=""
+
+    [ -n "$iface" ] || return 1
+
+    # Only meaningful when link is up
+    if ! ethIsLinkUp "$iface"; then
         return 1
     fi
 
-    # Use a no-op script to avoid flushing IPs
-    safe_dhcp_script="/tmp/dhcp-noop-$$.sh"
-    cat <<'EOF' > "$safe_dhcp_script"
-#!/bin/sh
-exit 0
-EOF
-    chmod +x "$safe_dhcp_script"
+    # Prefer sysfs (but can be -1 even when link is up)
+    if [ -r "/sys/class/net/$iface/speed" ]; then
+        sp=$(cat "/sys/class/net/$iface/speed" 2>/dev/null || true)
+        case "$sp" in ""|-1|*[!0-9]*) sp="" ;; esac
+        if [ -n "$sp" ] && [ "$sp" -gt 0 ] 2>/dev/null; then
+            printf '%s\n' "$sp"
+            return 0
+        fi
+    fi
 
-    log_info "Attempting DHCP on $iface safely..."
-    (udhcpc -i "$iface" -n -q -s "$safe_dhcp_script" >/dev/null 2>&1) &
-    dhcp_pid=$!
-    sleep "$timeout"
-    kill "$dhcp_pid" 2>/dev/null
-    rm -f "$safe_dhcp_script"
+    # Fallback: ethtool parse ("100Mb/s", "2500Mb/s", etc.)
+    if command -v ethtool >/dev/null 2>&1; then
+        sp=$(ethtool "$iface" 2>/dev/null \
+            | awk -F': ' '/^[[:space:]]*Speed:/ {print $2; exit 0}')
+        sp=$(printf '%s\n' "$sp" | sed -n 's/^\([0-9][0-9]*\)Mb\/s.*/\1/p')
+        case "$sp" in ""|*[!0-9]*) sp="" ;; esac
+        if [ -n "$sp" ]; then
+            printf '%s\n' "$sp"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+ethRestartAutoneg() {
+    iface=$1
+    [ -n "$iface" ] || return 1
+    command -v ethtool >/dev/null 2>&1 || return 1
+
+    # Restart autoneg/link training (if supported by driver)
+    ethtool -r "$iface" >/dev/null 2>&1 || return 1
     return 0
 }
 
+ethForceSpeedMbps() {
+    iface=$1
+    mbps=$2
+ 
+    [ -n "$iface" ] || return 1
+    command -v ethtool >/dev/null 2>&1 || return 1
+    case "$mbps" in ""|*[!0-9]*) return 1 ;; esac
+ 
+    ethtool -s "$iface" speed "$mbps" duplex full autoneg off >/dev/null 2>&1 || return 1
+    return 0
+}
+
+ethEnableAutoneg() {
+    iface=$1
+
+    [ -n "$iface" ] || return 1
+    command -v ethtool >/dev/null 2>&1 || return 1
+
+    ethtool -s "$iface" autoneg on >/dev/null 2>&1 || return 1
+    return 0
+}
+
+ethSupportsSpeedMbps() {
+    iface=$1
+    mbps=$2
+ 
+    [ -n "$iface" ] || return 1
+    case "$mbps" in ""|*[!0-9]*) return 1 ;; esac
+    command -v ethtool >/dev/null 2>&1 || return 1
+ 
+    ethtool "$iface" 2>/dev/null | grep -Eq "[[:space:]]${mbps}baseT/Full|[[:space:]]${mbps}baseT1/Full|[[:space:]]${mbps}baseX/Full"
+}
+
+# Returns: on/off/unknown (best-effort)
+ethGetAutonegState() {
+    iface=$1
+    [ -n "$iface" ] || return 1
+    command -v ethtool >/dev/null 2>&1 || { echo "unknown"; return 0; }
+
+    st=$(ethtool "$iface" 2>/dev/null | awk -F': ' '/^[[:space:]]*Auto-negotiation:/ {print $2; exit 0}' || true)
+    case "$st" in
+        on|off) echo "$st" ;;
+        *) echo "unknown" ;;
+    esac
+    return 0
+}
+
+# Heuristic: decide force order for 100M-only/locked ports
+# Echoes a space-separated list like: "1000 100" or "100 1000"
+ethPickForceOrder() {
+    iface=$1
+    [ -n "$iface" ] || { echo "1000 100"; return 0; }
+    command -v ethtool >/dev/null 2>&1 || { echo "1000 100"; return 0; }
+
+    # Pull supported/advertised modes blocks (best-effort)
+    modes=$(ethtool "$iface" 2>/dev/null | awk '
+        BEGIN{cap=0}
+        /^[[:space:]]*Supported link modes:/ {cap=1; print; next}
+        /^[[:space:]]*Advertised link modes:/ {cap=1; print; next}
+        cap==1 && /^[[:space:]]+[0-9]/ {print; next}
+        cap==1 && /^[^[:space:]]/ {cap=0}
+    ' || true)
+
+    # Default
+    order="1000 100"
+
+    # If we see no gig/2.5g/10g capability mentioned at all, prefer trying 100 first.
+    if [ -n "$modes" ]; then
+        if ! printf '%s\n' "$modes" | grep -Eq '1000baseT|2500baseT|5000baseT|10000baseT'; then
+            order="100 1000"
+        fi
+    fi
+
+    echo "$order"
+    return 0
+}
+
+ethEnsureLinkUpWithFallback() {
+    iface=$1
+    timeout_s=$2
+    [ -n "$iface" ] || return 1
+    [ -n "$timeout_s" ] || timeout_s=5
+    init_autoneg=$(ethGetAutonegState "$iface" 2>/dev/null || echo "unknown")
+    
+    # Bring interface up using existing helper (admin-up)
+    if command -v bringup_interface >/dev/null 2>&1; then
+        bringup_interface "$iface" 3 2 >/dev/null 2>&1 || true
+    else
+        ip link set "$iface" up >/dev/null 2>&1 || true
+        sleep 1
+    fi
+ 
+    # Let PHY settle a bit after admin-up
+    sleep 1
+ 
+    # 1) Wait for normal autoneg link
+    if ethWaitLinkUp "$iface" "$timeout_s"; then
+        return 0
+    fi
+ 
+    # If no ethtool, we cannot do fallback forcing
+    command -v ethtool >/dev/null 2>&1 || return 1
+ 
+    # 2) Try restarting autoneg once
+    if ethRestartAutoneg "$iface"; then
+        # Give retrain a moment before polling
+        sleep 1
+        if ethWaitLinkUp "$iface" "$timeout_s"; then
+            return 0
+        fi
+    fi
+ 
+    # 3) Force speeds (smart order: may try 100 first for 100M-only setups)
+    force_order=$(ethPickForceOrder "$iface" 2>/dev/null || echo "1000 100")
+    for sp in $force_order; do
+        if ethForceSpeedMbps "$iface" "$sp"; then
+            # After forcing speed, some PHYs need a short settle window
+            sleep 1
+ 
+            # Best-effort retrain
+            ethtool -r "$iface" >/dev/null 2>&1 || true
+            sleep 1
+ 
+            if ethWaitLinkUp "$iface" "$timeout_s"; then
+                # IMPORTANT: Do NOT restore autoneg here.
+                # If we had to force speed (autoneg off), keeping it avoids regression
+                # on 100M-only / locked ports (your exact case).
+                return 0
+            fi
+        fi
+    done
+ 
+    # Bring-up failed:
+    # If autoneg was originally on, restore it (best-effort) so we don't leave user in forced mode.
+    if [ "$init_autoneg" = "on" ]; then
+        ethEnableAutoneg "$iface" >/dev/null 2>&1 || true
+    fi
+    return 1
+}
 ###############################################################################
 # get_remoteproc_by_firmware <short-fw-name> [outfile] [all]
 # - If outfile is given: append *all* matches as "<path>|<state>|<firmware>|<name>"
@@ -2548,6 +2980,57 @@ bring_interface_up_down() {
         log_error "No ip or ifconfig tools found to bring $iface $state"
         return 1
     fi
+}
+
+is_valid_ipv4() {
+    ip="$1"
+    [ -n "$ip" ] || return 1
+    echo "$ip" | grep -q '^169\.254' && return 1
+    return 0
+}
+
+iface_link_up() {
+    iface="$1"
+    [ -n "$iface" ] || return 1
+
+    # Prefer functestlib helpers if present
+    if command -v ethIsLinkUp >/dev/null 2>&1; then
+        ethIsLinkUp "$iface"
+        return $?
+    fi
+    if command -v is_link_up >/dev/null 2>&1; then
+        is_link_up "$iface"
+        return $?
+    fi
+
+    # Fallback to carrier
+    [ -r "/sys/class/net/$iface/carrier" ] || return 1
+    [ "$(cat "/sys/class/net/$iface/carrier" 2>/dev/null)" = "1" ]
+}
+
+run_ping_check() {
+    iface="$1"
+
+    i=1
+    while [ "$i" -le "$PING_RETRIES" ]; do
+        log_info "Ping attempt $i/$PING_RETRIES: ping -I $iface -c $PING_COUNT -W $PING_WAIT_S $PING_TARGET"
+        ping_out="$(ping -I "$iface" -c "$PING_COUNT" -W "$PING_WAIT_S" "$PING_TARGET" 2>&1)"
+        ping_rc=$?
+
+        printf '%s\n' "$ping_out" | while IFS= read -r l; do
+            [ -n "$l" ] && log_info "[ping:$iface] $l"
+        done
+
+        if [ "$ping_rc" -eq 0 ]; then
+            return 0
+        fi
+
+        log_warn "Ping failed for $iface (rc=$ping_rc) (attempt $i/$PING_RETRIES)"
+        i=$((i + 1))
+        sleep 2
+    done
+
+    return 1
 }
 
 wifi_write_wpa_conf() {
