@@ -1,0 +1,37 @@
+metadata:
+  name: boot-systemd-kpi-loop
+  format: "Lava-Test Test Definition 1.0"
+  description: "Multi-boot KPI aggregator wrapper for Boot_Systemd_Validate with optional auto-reboot orchestration."
+  os:
+    - linux
+  scope:
+    - performance
+    - functional
+
+params:
+  # Where the child KPI script lives (Boot_Systemd_Validate)
+  KPI_SCRIPT: "./../Boot_Systemd_Validate/run.sh"
+  KPI_OUT_DIR: "./../Boot_Systemd_Validate/logs_Boot_Systemd_Validate"
+
+  # Averaging window / iteration collection
+  ITERATIONS: "5"
+  BOOT_TYPE: "cold" # cold|warm|unknown etc
+
+  # Forwarded knobs to Boot_Systemd_Validate
+  DISABLE_GETTY: "1" # 1|0
+  DISABLE_SSHD: "0" # 1|0
+  EXCLUDE_NETWORKD_WAIT_ONLINE: "1" # 1|0
+  EXCLUDE_SERVICES: "" # space-separated service names
+  NO_SVG: "1" # 1 disables svg
+  VERBOSE: "0" # 1 dumps key artifacts
+
+  # Orchestration
+  AUTO_REBOOT: "0" # 1 enables loop orchestration
+  REBOOT_RESULT_MODE: "PASS" # PASS (default) or SKIP when reboot requested mid-loop
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Performance/Boot_Systemd_KPI_Loop/ 
+    - ./run.sh || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh Boot_Systemd_KPI_Loop.res || true
