@@ -194,7 +194,7 @@ log_soc_info
 if [ -n "$BIN_DIR" ]; then
     :
 else
-    BIN_DIR="/usr/local/bin"
+    BIN_DIR="/usr/bin"
 fi
 
 case "$BIN_DIR" in
@@ -394,7 +394,7 @@ while [ "$i" -le "$REPEAT" ]; do
         log_dsp_remoteproc_status
     fi
 
-    if grep -q "All tests completed successfully" "$iter_log"; then
+	if [ -r "$iter_log" ] && grep -F -q -e "All tests completed successfully" -e "All applicable tests PASSED" "$iter_log"; then
         PASS_COUNT=$((PASS_COUNT+1))
         log_pass "$iter_tag: success"
     else
