@@ -30,6 +30,8 @@ fi
 # Always source functestlib.sh, using $TOOLS exported by init_env
 # shellcheck disable=SC1090,SC1091
 . "$TOOLS/functestlib.sh"
+# shellcheck disable=SC1090,SC1091
+. "$TOOLS/lib_display.sh"
 
 # --- Test metadata -----------------------------------------------------------
 TESTNAME="KMSCube"
@@ -70,6 +72,17 @@ weston_was_running=0
 if weston_is_running; then
     weston_stop
     weston_was_running=1
+fi
+
+# --- Skip if only CPU/software renderer is active (GPU HW accel not enabled) ---
+if command -v display_is_cpu_renderer >/dev/null 2>&1; then
+    if display_is_cpu_renderer auto; then
+        log_skip "$TESTNAME SKIP: GPU HW acceleration not enabled (CPU/software renderer detected)"
+        echo "${TESTNAME} SKIP" >"$RES_FILE"
+        exit 0
+    fi
+else
+    log_warn "display_is_cpu_renderer helper not found and cannot enforce GPU accel gating (continuing)."
 fi
 
 # --- Execute kmscube ---------------------------------------------------------
