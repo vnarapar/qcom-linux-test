@@ -1015,3 +1015,399 @@ weston_force_primary_1080p60_if_not_60() {
 
     return "$wf_ret"
 }
+
+###############################################################################
+# EGL / GL pipeline introspection (eglinfo parser)
+###############################################################################
+
+# Optional: EGLINFO_DEBUG=1 to dump full eglinfo output when a platform fails.
+
+egli_pick_platform_flag() {
+  EGLINFO="${EGLINFO:-eglinfo}"
+
+  # NEW: treat missing/unusable eglinfo as a real failure (return 1)
+  if ! command -v "$EGLINFO" >/dev/null 2>&1; then
+    echo ""
+    return 1
+  fi
+
+  # Keep existing behavior: try to detect supported flag from --help.
+  # NOTE: we no longer force "|| true" so we can detect a true failure.
+  help_out="$("$EGLINFO" --help 2>&1)"
+  rc=$?
+
+  # NEW: if --help truly failed and produced nothing, signal failure
+  if [ "$rc" -ne 0 ] && [ -z "${help_out:-}" ]; then
+    echo ""
+    return 1
+  fi
+
+  if echo "$help_out" | grep -qi -- '--platform'; then
+    echo "--platform"
+    return 0
+  fi
+
+  if echo "$help_out" | grep -Eqi '(^|[[:space:]])-p([[:space:]]|,|$)'; then
+    echo "-p"
+    return 0
+  fi
+
+  if echo "$help_out" | grep -Eqi '(^|[[:space:]])-P([[:space:]]|,|$)'; then
+    echo "-P"
+    return 0
+  fi
+
+  # No platform selection flag supported — not an error
+  echo ""
+  return 0
+}
+
+egli_get_field() {
+  key="$1"
+  awk -v k="$key" '
+    BEGIN { IGNORECASE=1 }
+
+    function trim(s) {
+      gsub(/^[[:space:]]+/, "", s)
+      gsub(/[[:space:]]+$/, "", s)
+      return s
+    }
+
+    function emit_after_colon(line) {
+      sub("^[^:]*:[[:space:]]*", "", line)
+      line = trim(line)
+      if (line != "") {
+        print line
+        exit
+      }
+    }
+
+    {
+      line = $0
+
+      # 1) Fast-path: key at column 1: "KEY: value"
+      if (index(tolower(line), tolower(k ":")) == 1) {
+        emit_after_colon(line)
+      }
+
+      # 2) Mesa eglinfo style: "OpenGL ... vendor: freedreno" / "renderer: ..."
+      # Callers pass keys like "OpenGL vendor string" or "GL_VENDOR".
+      if (tolower(k) ~ /vendor/ && line ~ /^[[:space:]]*OpenGL/ && line ~ / vendor[[:space:]]*:/) {
+        emit_after_colon(line)
+      }
+      if (tolower(k) ~ /renderer/ && line ~ /^[[:space:]]*OpenGL/ && line ~ / renderer[[:space:]]*:/) {
+        emit_after_colon(line)
+      }
+
+      # 3) Allow leading whitespace: " OpenGL vendor string: ..."
+      if (tolower(line) ~ "^[[:space:]]*" tolower(k) "[[:space:]]*:") {
+        emit_after_colon(line)
+      }
+    }
+  '
+}
+
+egli_get_first() {
+  # $1 = full text, rest = keys (try in order)
+  text="$1"
+  shift
+
+  for key in "$@"; do
+    val="$(printf '%s\n' "$text" | egli_get_field "$key")"
+    if [ -n "$val" ]; then
+      printf '%s\n' "$val"
+      return 0
+    fi
+  done
+
+  printf '%s\n' ""
+  return 0
+}
+
+egli_classify_pipeline() {
+  # Inputs: driver gl_vendor gl_renderer
+  d="$1"
+  v="$2"
+  r="$3"
+
+  # CPU / software fallbacks (Mesa swrast/llvmpipe/etc.)
+  if printf '%s %s %s\n' "$d" "$v" "$r" | grep -Eqi \
+    '(llvmpipe|softpipe|swrast|kms_swrast|lavapipe|virgl|swiftshader)'; then
+    printf '%s\n' "CPU (software)"
+    return 0
+  fi
+
+  # If it’s not obviously software, treat as GPU/hardware.
+  printf '%s\n' "GPU (hardware)"
+  return 0
+}
+
+egli_print_legacy() {
+  plat="$1"
+  driver="$2"
+  gl_vendor="$3"
+  gl_renderer="$4"
+
+  plat_up="$(printf '%s' "$plat" | tr '[:lower:]' '[:upper:]')"
+
+  log_info "EGLINFO: Pipeline=${plat_up} platform:"
+
+  [ -n "$driver" ] || driver="(unknown)"
+  [ -n "$gl_vendor" ] || gl_vendor="(unknown)"
+  [ -n "$gl_renderer" ] || gl_renderer="(unknown)"
+
+  # Align EXACTLY to your sample log format (no extra indentation)
+  log_info "EGLINFO: EGL driver name: $driver"
+  log_info "EGLINFO: GL_VENDOR: $gl_vendor"
+  log_info "EGLINFO: GL_RENDERER: $gl_renderer"
+}
+
+egli_try_one_platform() {
+  plat="$1"
+  plat_flag="$2"
+
+  EGLINFO="${EGLINFO:-eglinfo}"
+
+  if [ -n "$plat_flag" ]; then
+    out="$("$EGLINFO" "$plat_flag" "$plat" 2>&1)"
+    rc=$?
+  else
+    out="$(EGL_PLATFORM="$plat" "$EGLINFO" 2>&1)"
+    rc=$?
+  fi
+
+  # “Initialized?” heuristic: at least one of these should exist
+  egl_vendor="$(printf '%s\n' "$out" | egli_get_field "EGL vendor string")"
+  egl_version="$(printf '%s\n' "$out" | egli_get_field "EGL version string")"
+  egl_api_ver="$(printf '%s\n' "$out" | egli_get_field "EGL API version")"
+
+  ok=0
+  if [ -n "$egl_vendor" ]; then ok=1; fi
+  if [ -n "$egl_version" ]; then ok=1; fi
+  if [ -n "$egl_api_ver" ]; then ok=1; fi
+
+  if [ "$rc" -ne 0 ] || [ "$ok" -eq 0 ]; then
+    log_warn "eglinfo platform '$plat' did not initialize cleanly (rc=$rc)."
+    if [ "${EGLINFO_DEBUG:-0}" = "1" ]; then
+      log_info "---- eglinfo output (platform '$plat') ----"
+      printf '%s\n' "$out"
+      log_info "---- end eglinfo output ----"
+    fi
+    return 1
+  fi
+
+  # Driver name
+  driver="$(egli_get_first "$out" \
+    "EGL driver name" \
+    "EGL driver" \
+    "Driver name" \
+    "Driver")"
+
+  # GL vendor (prefer explicit GL_VENDOR if present)
+  gl_vendor="$(egli_get_first "$out" \
+    "GL_VENDOR" \
+    "OpenGL ES profile vendor string" \
+    "OpenGL vendor string" \
+    "OpenGL ES vendor string")"
+
+  # GL renderer (prefer explicit GL_RENDERER if present)
+  gl_renderer="$(egli_get_first "$out" \
+    "GL_RENDERER" \
+    "OpenGL ES profile renderer string" \
+    "OpenGL renderer string" \
+    "OpenGL ES renderer string")"
+
+  # NEW: avoid classification on empty strings
+  [ -n "$driver" ] || driver="unknown"
+  [ -n "$gl_vendor" ] || gl_vendor="unknown"
+  [ -n "$gl_renderer" ] || gl_renderer="unknown"
+
+  # If we got nothing useful, treat as failure (prevents misleading GPU/CPU label)
+  if [ "$driver" = "unknown" ] && [ "$gl_vendor" = "unknown" ] && [ "$gl_renderer" = "unknown" ]; then
+    log_warn "eglinfo platform '$plat' returned no driver/vendor/renderer strings; skipping classification."
+    return 1
+  fi
+
+  # Print GPU/CPU pipeline type (align to your sample: no extra indentation)
+  pipe_kind="$(egli_classify_pipeline "$driver" "$gl_vendor" "$gl_renderer")"
+  log_info "EGLINFO: Pipeline type: $pipe_kind"
+
+  egli_print_legacy "$plat" "$driver" "$gl_vendor" "$gl_renderer"
+  return 0
+}
+
+display_print_eglinfo_pipeline() {
+  # Usage: display_print_eglinfo_pipeline auto|wayland|gbm|device|surfaceless
+  mode="${1:-auto}"
+
+  EGLINFO="${EGLINFO:-eglinfo}"
+  if ! command -v "$EGLINFO" >/dev/null 2>&1; then
+    log_error "eglinfo not found (EGLINFO='$EGLINFO')"
+    return 1
+  fi
+
+  # NOTE: unchanged usage; now egli_pick_platform_flag can return 1
+  # but when it does, plat_flag will be empty and caller already checked eglinfo.
+  plat_flag="$(egli_pick_platform_flag 2>/dev/null)" || plat_flag=""
+
+  log_info "---------------- EGLINFO pipeline detection (select one) ----------------"
+
+  if [ "$mode" = "auto" ]; then
+    if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+      if egli_try_one_platform "wayland" "$plat_flag"; then
+        log_info "---------------- End EGLINFO pipeline detection --------------------------"
+        return 0
+      fi
+    fi
+
+    if egli_try_one_platform "gbm" "$plat_flag"; then
+      log_info "---------------- End EGLINFO pipeline detection --------------------------"
+      return 0
+    fi
+
+    if egli_try_one_platform "device" "$plat_flag"; then
+      log_info "---------------- End EGLINFO pipeline detection --------------------------"
+      return 0
+    fi
+
+    if egli_try_one_platform "surfaceless" "$plat_flag"; then
+      log_info "---------------- End EGLINFO pipeline detection --------------------------"
+      return 0
+    fi
+
+    log_warn "No working eglinfo platform found (tried wayland/gbm/device/surfaceless)."
+    log_info "---------------- End EGLINFO pipeline detection --------------------------"
+    return 1
+  fi
+
+  case "$mode" in
+    wayland|gbm|device|surfaceless)
+      if ! egli_try_one_platform "$mode" "$plat_flag"; then
+        log_warn "Requested '$mode' did not work. Trying fallbacks..."
+
+        if ! egli_try_one_platform "gbm" "$plat_flag"; then
+          if ! egli_try_one_platform "device" "$plat_flag"; then
+            if ! egli_try_one_platform "surfaceless" "$plat_flag"; then
+              if ! egli_try_one_platform "wayland" "$plat_flag"; then
+                log_warn "No fallback platforms worked either."
+              fi
+            fi
+          fi
+        fi
+      fi
+
+      log_info "---------------- End EGLINFO pipeline detection --------------------------"
+      return 0
+      ;;
+    *)
+      log_warn "Unknown mode '$mode' (use: auto|wayland|gbm|device|surfaceless). Defaulting to auto."
+      display_print_eglinfo_pipeline auto
+      return $?
+      ;;
+  esac
+}
+
+###############################################################################
+# GPU accel gating (detect-only)
+###############################################################################
+display_is_cpu_renderer() {
+  # Usage: display_is_cpu_renderer <mode>
+  # Prints EGLINFO block when called (your requirement).
+  # Returns: 0 if CPU/software renderer detected, 1 otherwise (GPU or unknown)
+  mode="${1:-auto}"
+
+  # Always print EGLINFO pipeline detection (do NOT redirect)
+  display_print_eglinfo_pipeline "$mode" || true
+
+  EGLINFO="${EGLINFO:-eglinfo}"
+  if ! command -v "$EGLINFO" >/dev/null 2>&1; then
+    return 1
+  fi
+
+  # NOTE: unchanged usage; now egli_pick_platform_flag can return 1
+  plat_flag="$(egli_pick_platform_flag 2>/dev/null)" || plat_flag=""
+
+  # Run eglinfo and decide CPU/software for one platform.
+  # Return 0 if CPU/software, 1 otherwise.
+  egli_is_cpu_for_platform() {
+    p="$1"
+
+    if [ -n "$plat_flag" ]; then
+      out="$("$EGLINFO" "$plat_flag" "$p" 2>&1)"
+      rc=$?
+    else
+      out="$(EGL_PLATFORM="$p" "$EGLINFO" 2>&1)"
+      rc=$?
+    fi
+
+    # Must initialize
+    egl_vendor="$(printf '%s\n' "$out" | egli_get_field "EGL vendor string")"
+    egl_version="$(printf '%s\n' "$out" | egli_get_field "EGL version string")"
+    egl_api_ver="$(printf '%s\n' "$out" | egli_get_field "EGL API version")"
+
+    ok=0
+    if [ -n "$egl_vendor" ]; then ok=1; fi
+    if [ -n "$egl_version" ]; then ok=1; fi
+    if [ -n "$egl_api_ver" ]; then ok=1; fi
+    if [ "$rc" -ne 0 ] || [ "$ok" -eq 0 ]; then
+      return 1
+    fi
+
+    driver="$(egli_get_first "$out" \
+      "EGL driver name" \
+      "EGL driver" \
+      "Driver name" \
+      "Driver")"
+
+    gl_vendor="$(egli_get_first "$out" \
+      "GL_VENDOR" \
+      "OpenGL ES profile vendor string" \
+      "OpenGL vendor string" \
+      "OpenGL ES vendor string")"
+
+    gl_renderer="$(egli_get_first "$out" \
+      "GL_RENDERER" \
+      "OpenGL ES profile renderer string" \
+      "OpenGL renderer string" \
+      "OpenGL ES renderer string")"
+
+    # NEW: avoid classification on empty strings
+    [ -n "$driver" ] || driver="unknown"
+    [ -n "$gl_vendor" ] || gl_vendor="unknown"
+    [ -n "$gl_renderer" ] || gl_renderer="unknown"
+
+    # If we got nothing useful, treat as not-CPU (unknown) rather than mislabel
+    if [ "$driver" = "unknown" ] && [ "$gl_vendor" = "unknown" ] && [ "$gl_renderer" = "unknown" ]; then
+      return 1
+    fi
+
+    pipe_kind="$(egli_classify_pipeline "$driver" "$gl_vendor" "$gl_renderer")"
+    if printf '%s\n' "$pipe_kind" | grep -qi '^CPU'; then
+      return 0
+    fi
+    return 1
+  }
+
+  if [ "$mode" = "auto" ]; then
+    # Match display_print_eglinfo_pipeline(auto) preference order.
+    if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+      if egli_is_cpu_for_platform "wayland"; then return 0; fi
+    fi
+    if egli_is_cpu_for_platform "gbm"; then return 0; fi
+    if egli_is_cpu_for_platform "device"; then return 0; fi
+    if egli_is_cpu_for_platform "surfaceless"; then return 0; fi
+    return 1
+  fi
+
+  case "$mode" in
+    wayland|gbm|device|surfaceless)
+      if egli_is_cpu_for_platform "$mode"; then
+        return 0
+      fi
+      return 1
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
