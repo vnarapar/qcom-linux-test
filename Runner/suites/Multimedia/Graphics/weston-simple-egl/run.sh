@@ -200,6 +200,17 @@ if command -v display_debug_snapshot >/dev/null 2>&1; then
     display_debug_snapshot "${TESTNAME}: after-ensure-60hz"
 fi
 
+# --- Skip if only CPU/software renderer is active (GPU HW accel not enabled) ---
+if command -v display_is_cpu_renderer >/dev/null 2>&1; then
+    if display_is_cpu_renderer auto; then
+        log_skip "$TESTNAME SKIP: GPU HW acceleration not enabled (CPU/software renderer detected)"
+        echo "${TESTNAME} SKIP" >"$RES_FILE"
+        exit 0
+    fi
+else
+    log_warn "display_is_cpu_renderer helper not found and cannot enforce GPU accel gating (continuing)."
+fi
+
 # ---------------------------------------------------------------------------
 # Binary & EGL vendor override
 # ---------------------------------------------------------------------------
