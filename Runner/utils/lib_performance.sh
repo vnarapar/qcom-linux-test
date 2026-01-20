@@ -2145,3 +2145,613 @@ perf_sysbench_gate_eval_line_safe() {
   perf_sysbench_gate_eval_line "$f" "$sb_case" "$thr" "$metric" "$avg" "$delta"
   return $?
 }
+
+###############################################################################
+# Tiotest helpers (Storage_Tiotest)
+###############################################################################
+tiotest_is_tmpfs_path() {
+  # Best-effort: detect if a path is on tmpfs
+  # Usage: tiotest_is_tmpfs_path /path ; returns 0 if tmpfs, 1 otherwise
+  p=$1
+  [ -z "$p" ] && return 1
+  if command -v df >/dev/null 2>&1; then
+    # BusyBox df prints "Filesystem" and type may not be available.
+    # Use /proc/mounts as primary.
+    :
+  fi
+  if [ -r /proc/mounts ]; then
+    # Find the mountpoint for p and check fstype
+    # Simple heuristic: if any mount entry matches prefix and fstype=tmpfs
+    mp=""
+    while read -r _dev mnt fstype rest; do
+      case "$p" in
+        "$mnt"|"$mnt"/*)
+          # pick longest matching mountpoint
+          if [ -z "$mp" ] || [ "${#mnt}" -gt "${#mp}" ]; then
+            mp="$mnt"
+            mpfstype="$fstype"
+          fi
+          ;;
+      esac
+    done </proc/mounts
+    [ "${mpfstype:-}" = "tmpfs" ] && return 0
+  fi
+  return 1
+}
+
+tiotest_drop_caches_best_effort() {
+  # Avoid SC2015; best-effort only
+  if command -v perf_drop_caches >/dev/null 2>&1; then
+    perf_drop_caches 2>/dev/null || true
+    return 0
+  fi
+  # fallback
+  if [ -w /proc/sys/vm/drop_caches ]; then
+    sync 2>/dev/null || true
+    echo 3 >/proc/sys/vm/drop_caches 2>/dev/null || true
+    return 0
+  fi
+  return 1
+}
+
+tiotest_extract_mbps() {
+  # Extract MB/s rate from tiotest tables; returns the LAST matching row.
+  # Args: <logfile> <label_regex>   (ex: "Write" or "Read")
+  logf=$1
+  lbl=$2
+ 
+  awk -v lbl="$lbl" '
+    BEGIN{v=""}
+    /^[[:space:]]*\|/ && $0 ~ lbl {
+      if (match($0, /[0-9]+(\.[0-9]+)?[[:space:]]*MB\/s/)) {
+        s=substr($0, RSTART, RLENGTH)
+        gsub(/[[:space:]]*MB\/s/, "", s)
+        v=s
+      }
+    }
+    END{
+      if (v=="") exit 1
+      print v
+    }
+  ' "$logf"
+}
+
+tiotest_extract_iops() {
+  # Many tiotest builds print IOPS only for random rows; if absent returns empty.
+  # Args: <logfile> <label_regex>
+  logf=$1
+  lbl=$2
+
+  # Try to capture number in an "IOPS" column if present.
+  # We do not assume fixed column count; instead grep a number near "IOPS".
+  awk -v lbl="$lbl" '
+    BEGIN{v=""}
+    /^\|/ && $0 ~ lbl {
+      # If line contains IOPS number, try to pick it.
+      # Common format: "... | 11624 | ..."
+      # We take the largest integer on the line as a heuristic.
+      nmax=""
+      for (i=1;i<=NF;i++){
+        if ($i ~ /^[0-9]+$/) {
+          if (nmax=="" || $i+0 > nmax+0) nmax=$i
+        }
+      }
+      v=nmax
+    }
+    END{ print v }
+  ' "$logf" 2>/dev/null
+}
+
+tiotest_extract_latency_block() {
+  logf=$1
+  item=$2   # "Write" / "Read" / "Random Write" / "Random Read"
+ 
+  awk -v item="$item" '
+    BEGIN { inblk=0; la=""; lm=""; p2=""; p10="" }
+ 
+    /^Tiotest latency results/ { inblk=1; next }
+    inblk==1 && /^`/ { inblk=0 }                  # end of ascii table (best-effort)
+ 
+    # Match the latency row for the requested item
+    inblk==1 && $0 ~ /^\|/ && $0 ~ ("|[[:space:]]*" item "[[:space:]]*\\|") {
+      # Extract numbers that appear *after* the item label.
+      # Latency rows look like:
+      # | Write | 0.002 ms | 0.022 ms | 0.00000 | 0.00000 |
+      # We collect numeric tokens only, ignoring "ms" and pipes.
+      n=0
+      for (i=1; i<=NF; i++) {
+        if ($i ~ /^[0-9]+(\.[0-9]+)?$/) {
+          n++
+          if (n==1) la=$i
+          else if (n==2) lm=$i
+          else if (n==3) p2=$i
+          else if (n==4) p10=$i
+        }
+      }
+    }
+ 
+    END {
+      # Print only numeric fields; empty means "not found"
+      printf "%s\t%s\t%s\t%s\n", la, lm, p2, p10
+    }
+  ' "$logf" 2>/dev/null
+}
+
+tiotest_metrics_append() {
+  mf=$1; mode=$2; thr=$3; mbps=$4; iops=$5; latavg=$6; latmax=$7; pct2=$8; pct10=$9
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$mode" "$thr" "${mbps:-}" "${iops:-}" "${latavg:-}" "${latmax:-}" "${pct2:-}" "${pct10:-}" >>"$mf"
+}
+
+# ---------------- perf helpers: normalize/validate numeric metrics ----------------
+ 
+perf_norm_metric() {
+  case "${1:-}" in
+    ""|"unknown"|"UNKNOWN"|"NA"|"N/A"|"n/a") printf "%s" "NA" ;;
+    *) printf "%s" "$1" ;;
+  esac
+}
+ 
+perf_is_number() {
+  # integer or decimal (e.g., 10, 10.5, 0.000)
+  echo "${1:-}" | awk '
+    $0 ~ /^[0-9]+([.][0-9]+)?$/ { exit 0 }
+    { exit 1 }
+  '
+}
+ 
+perf_append_if_number() {
+  # $1=file $2=value
+  if perf_is_number "${2:-}"; then
+    perf_values_append "$1" "$2"
+  fi
+}
+
+tiotest_build_common_args() {
+  # Helper: build common flags list for tiotest
+  # Echoes args; caller can use: set -- $(tiotest_build_common_args ...)
+  # Args:
+  # threads dir use_raw block_bytes file_mb rnd_ops hide_lat terse W S c debug offset_mb offset_first
+  tt=$1; dir=$2; use_raw=$3
+  bs=$4; fmb=$5; rops=$6
+  hide_lat=$7; terse=$8; wphase=$9; syncw=${10}; cons=${11}; dbg=${12}
+  offmb=${13}; ofirst=${14}
+
+  args="-t $tt -d $dir -b $bs -f $fmb"
+  if [ "$use_raw" = "1" ]; then
+    args="$args -R"
+    [ -n "$offmb" ] && args="$args -o $offmb"
+    [ "$ofirst" = "1" ] && args="$args -O"
+  fi
+  [ -n "$rops" ] && args="$args -r $rops"
+  [ "$hide_lat" = "1" ] && args="$args -L"
+  [ "$terse" = "1" ] && args="$args -T"
+  [ "$wphase" = "1" ] && args="$args -W"
+  [ "$syncw" = "1" ] && args="$args -S"
+  [ "$cons" = "1" ] && args="$args -c"
+  [ -n "$dbg" ] && args="$args -D $dbg"
+
+  echo "$args"
+}
+
+perf_tiotest_run_seq_pair() {
+  # Run sequential Write+Read in ONE invocation and collect:
+  #  - MB/s for Write and Read
+  #  - IOPS (estimated from MB/s and block size)
+  #  - Latency stats if present (avg/max/%>2s/%>10s), otherwise leave empty
+  #
+  # Args:
+  # bin threads dir use_raw seq_block seq_file_mb hide_lat terse W S c debug offset_mb offset_first logf metrics
+  bin=$1; tt=$2; dir=$3; use_raw=$4
+  bs=$5; fmb=$6
+  hide_lat=$7; terse=$8; wphase=$9; syncw=${10}; cons=${11}; dbg=${12}
+  offmb=${13}; ofirst=${14}
+  logf=${15}; metrics=${16}
+ 
+  : >"$logf" 2>/dev/null || true
+ 
+  common=$(tiotest_build_common_args "$tt" "$dir" "$use_raw" "$bs" "$fmb" "" \
+    "$hide_lat" "$terse" "$wphase" "$syncw" "$cons" "$dbg" "$offmb" "$ofirst")
+ 
+  log_info "RUN: $bin $common -k 1 -k 3"
+  # shellcheck disable=SC2086
+  "$bin" $common -k 1 -k 3 >>"$logf" 2>&1 || true
+ 
+  # ---------------- MB/s ----------------
+  seqwr_mbps=$(tiotest_extract_mbps "$logf" "Write" 2>/dev/null || true)
+  seqrd_mbps=$(tiotest_extract_mbps "$logf" "Read" 2>/dev/null || true)
+ 
+  # ---------------- IOPS estimate ----------------
+  seqwr_iops=""
+  seqrd_iops=""
+  if [ -n "$bs" ] && [ "$bs" -gt 0 ] 2>/dev/null; then
+    if [ -n "$seqwr_mbps" ]; then
+      seqwr_iops=$(awk -v mbps="$seqwr_mbps" -v b="$bs" 'BEGIN{ if (b>0) printf "%.0f", (mbps*1024*1024)/b }' 2>/dev/null)
+    fi
+    if [ -n "$seqrd_mbps" ]; then
+      seqrd_iops=$(awk -v mbps="$seqrd_mbps" -v b="$bs" 'BEGIN{ if (b>0) printf "%.0f", (mbps*1024*1024)/b }' 2>/dev/null)
+    fi
+  fi
+ 
+  # ---------------- Latency (best-effort) ----------------
+  # Strictly parse numeric columns from:
+  # | Write | <avg> ms | <max> ms | <pct2> | <pct10> |
+  # | Read  | <avg> ms | <max> ms | <pct2> | <pct10> |
+  # Ensures we never output "Write"/"|" into metrics.tsv.
+  seqwr_latavg=""; seqwr_latmax=""; seqwr_pct2=""; seqwr_pct10=""
+  seqrd_latavg=""; seqrd_latmax=""; seqrd_pct2=""; seqrd_pct10=""
+ 
+  row=$(awk '
+    BEGIN { inlat=0; la=""; lm=""; p2=""; p10="" }
+    /^Tiotest latency results/ { inlat=1; next }
+    inlat==1 && $0 ~ /^\|/ && $0 ~ /|[[:space:]]*Write[[:space:]]*\|/ {
+      n=0
+      for (i=1;i<=NF;i++){
+        if ($i ~ /^[0-9]+(\.[0-9]+)?$/) {
+          n++
+          if (n==1) la=$i
+          else if (n==2) lm=$i
+          else if (n==3) p2=$i
+          else if (n==4) p10=$i
+        }
+      }
+    }
+    END {
+      if (la=="") exit 1
+      printf "%s\t%s\t%s\t%s\n", la, lm, p2, p10
+    }
+  ' "$logf" 2>/dev/null || true)
+ 
+  if [ -n "$row" ]; then
+    # split by tabs
+    seqwr_latavg=$(printf '%s' "$row" | awk -F'\t' '{print $1}')
+    seqwr_latmax=$(printf '%s' "$row" | awk -F'\t' '{print $2}')
+    seqwr_pct2=$(printf '%s' "$row" | awk -F'\t' '{print $3}')
+    seqwr_pct10=$(printf '%s' "$row" | awk -F'\t' '{print $4}')
+  fi
+ 
+  row=$(awk '
+    BEGIN { inlat=0; la=""; lm=""; p2=""; p10="" }
+    /^Tiotest latency results/ { inlat=1; next }
+    inlat==1 && $0 ~ /^\|/ && $0 ~ /|[[:space:]]*Read[[:space:]]*\|/ {
+      n=0
+      for (i=1;i<=NF;i++){
+        if ($i ~ /^[0-9]+(\.[0-9]+)?$/) {
+          n++
+          if (n==1) la=$i
+          else if (n==2) lm=$i
+          else if (n==3) p2=$i
+          else if (n==4) p10=$i
+        }
+      }
+    }
+    END {
+      if (la=="") exit 1
+      printf "%s\t%s\t%s\t%s\n", la, lm, p2, p10
+    }
+  ' "$logf" 2>/dev/null || true)
+ 
+  if [ -n "$row" ]; then
+    seqrd_latavg=$(printf '%s' "$row" | awk -F'\t' '{print $1}')
+    seqrd_latmax=$(printf '%s' "$row" | awk -F'\t' '{print $2}')
+    seqrd_pct2=$(printf '%s' "$row" | awk -F'\t' '{print $3}')
+    seqrd_pct10=$(printf '%s' "$row" | awk -F'\t' '{print $4}')
+  fi
+ 
+  # ---------------- Emit metrics (8 columns) ----------------
+  tiotest_metrics_append "$metrics" "seqwr" "$tt" "$seqwr_mbps" "$seqwr_iops" \
+    "$seqwr_latavg" "$seqwr_latmax" "$seqwr_pct2" "$seqwr_pct10"
+ 
+  tiotest_metrics_append "$metrics" "seqrd" "$tt" "$seqrd_mbps" "$seqrd_iops" \
+    "$seqrd_latavg" "$seqrd_latmax" "$seqrd_pct2" "$seqrd_pct10"
+ 
+  if [ -z "$seqwr_mbps" ] && [ -z "$seqrd_mbps" ]; then
+    return 1
+  fi
+  return 0
+}
+
+perf_tiotest_run_rnd_pair() {
+  # Random pair runner with robust rndwr + rndrd capture and clean 8-column TSV emission.
+  # Primary: run BOTH (Write+Read) using -k 1 -k 3 (matches your proven manual command).
+  # Fallback: legacy probing if Read doesn't appear (some builds behave oddly / pid-file issues).
+  #
+  # Args:
+  # bin threads dir use_raw rnd_block rnd_file_mb rnd_ops hide_lat terse W S c debug offset_mb offset_first logf metrics
+  bin=$1; tt=$2; dir=$3; use_raw=$4
+  bs=$5; fmb=$6; rops=$7
+  hide_lat=$8; terse=$9; wphase=${10}; syncw=${11}; cons=${12}; dbg=${13}
+  offmb=${14}; ofirst=${15}
+  logf=${16}; metrics=${17}
+ 
+  : >"$logf" 2>/dev/null || true
+ 
+  common=$(tiotest_build_common_args "$tt" "$dir" "$use_raw" "$bs" "$fmb" "$rops" \
+    "$hide_lat" "$terse" "$wphase" "$syncw" "$cons" "$dbg" "$offmb" "$ofirst")
+ 
+  tmp_both="${logf}.rndboth.tmp"
+  tmp_wr="${logf}.rndwr.tmp"
+  tmp_rd="${logf}.rndrd.tmp"
+  : >"$tmp_both" 2>/dev/null || true
+  : >"$tmp_wr" 2>/dev/null || true
+  : >"$tmp_rd" 2>/dev/null || true
+ 
+  rndwr_mbps=""; rndwr_iops=""; rndwr_latavg=""; rndwr_latmax=""; rndwr_pct2=""; rndwr_pct10=""
+  rndrd_mbps=""; rndrd_iops=""; rndrd_latavg=""; rndrd_latmax=""; rndrd_pct2=""; rndrd_pct10=""
+ 
+  # ---------------- Primary: BOTH random write + random read ----------------
+  log_info "RUN (rnd both): $bin $common -k 1 -k 3"
+  # shellcheck disable=SC2086
+  "$bin" $common -k 1 -k 3 >"$tmp_both" 2>&1 || true
+  cat "$tmp_both" >>"$logf" 2>/dev/null || true
+ 
+  rndwr_mbps=$(tiotest_extract_mbps "$tmp_both" "Write" 2>/dev/null || true)
+  rndrd_mbps=$(tiotest_extract_mbps "$tmp_both" "Read" 2>/dev/null || true)
+ 
+  # Latency parsing (best-effort): strict match "| Write |" and "| Read |"
+  row=$(awk '
+    BEGIN { inlat=0; la=""; lm=""; p2=""; p10="" }
+    /^Tiotest latency results/ { inlat=1; next }
+    inlat==1 && $0 ~ /^\|/ && $0 ~ /|[[:space:]]*Write[[:space:]]*\|/ {
+      n=0
+      for (i=1;i<=NF;i++){
+        if ($i ~ /^[0-9]+(\.[0-9]+)?$/) {
+          n++
+          if (n==1) la=$i
+          else if (n==2) lm=$i
+          else if (n==3) p2=$i
+          else if (n==4) p10=$i
+        }
+      }
+    }
+    END {
+      if (la=="") exit 1
+      printf "%s\t%s\t%s\t%s\n", la, lm, p2, p10
+    }
+  ' "$tmp_both" 2>/dev/null || true)
+  if [ -n "$row" ]; then
+    rndwr_latavg=$(printf '%s' "$row" | awk -F'\t' '{print $1}')
+    rndwr_latmax=$(printf '%s' "$row" | awk -F'\t' '{print $2}')
+    rndwr_pct2=$(printf '%s' "$row" | awk -F'\t' '{print $3}')
+    rndwr_pct10=$(printf '%s' "$row" | awk -F'\t' '{print $4}')
+  fi
+ 
+  row=$(awk '
+    BEGIN { inlat=0; la=""; lm=""; p2=""; p10="" }
+    /^Tiotest latency results/ { inlat=1; next }
+    inlat==1 && $0 ~ /^\|/ && $0 ~ /|[[:space:]]*Read[[:space:]]*\|/ {
+      n=0
+      for (i=1;i<=NF;i++){
+        if ($i ~ /^[0-9]+(\.[0-9]+)?$/) {
+          n++
+          if (n==1) la=$i
+          else if (n==2) lm=$i
+          else if (n==3) p2=$i
+          else if (n==4) p10=$i
+        }
+      }
+    }
+    END {
+      if (la=="") exit 1
+      printf "%s\t%s\t%s\t%s\n", la, lm, p2, p10
+    }
+  ' "$tmp_both" 2>/dev/null || true)
+  if [ -n "$row" ]; then
+    rndrd_latavg=$(printf '%s' "$row" | awk -F'\t' '{print $1}')
+    rndrd_latmax=$(printf '%s' "$row" | awk -F'\t' '{print $2}')
+    rndrd_pct2=$(printf '%s' "$row" | awk -F'\t' '{print $3}')
+    rndrd_pct10=$(printf '%s' "$row" | awk -F'\t' '{print $4}')
+  fi
+ 
+  # If Read missing, fallback to legacy probing
+  if [ -z "$rndrd_mbps" ]; then
+    log_info "rndrd missing in primary run; falling back to legacy probing"
+ 
+    # Phase 1: try to collect write
+    log_info "RUN (rndwr fallback): $bin $common -k 0 -k 2 -k 3"
+    # shellcheck disable=SC2086
+    "$bin" $common -k 0 -k 2 -k 3 >"$tmp_wr" 2>&1 || true
+    cat "$tmp_wr" >>"$logf" 2>/dev/null || true
+    [ -z "$rndwr_mbps" ] && rndwr_mbps=$(tiotest_extract_mbps "$tmp_wr" "Write" 2>/dev/null || true)
+ 
+    # Phase 2: prep + attempt read (best-effort)
+    log_info "RUN (rndrd+prep fallback): $bin -t $tt -d $dir -b $bs -f $fmb -k 1 -k 2 -k 3 ; then $bin $common -k 0 -k 1 -k 2"
+    "$bin" -t "$tt" -d "$dir" -b "$bs" -f "$fmb" -k 1 -k 2 -k 3 >>"$tmp_rd" 2>&1 || true
+    # shellcheck disable=SC2086
+    "$bin" $common -k 0 -k 1 -k 2 >>"$tmp_rd" 2>&1 || true
+    cat "$tmp_rd" >>"$logf" 2>/dev/null || true
+ 
+    [ -z "$rndwr_mbps" ] && rndwr_mbps=$(tiotest_extract_mbps "$tmp_rd" "Write" 2>/dev/null || true)
+    rndrd_mbps=$(tiotest_extract_mbps "$tmp_rd" "Read" 2>/dev/null || true)
+ 
+    # Latency from fallback read log (if any)
+    if [ -z "$rndwr_latavg" ]; then
+      row=$(awk '
+        BEGIN { inlat=0; la=""; lm=""; p2=""; p10="" }
+        /^Tiotest latency results/ { inlat=1; next }
+        inlat==1 && $0 ~ /^\|/ && $0 ~ /|[[:space:]]*Write[[:space:]]*\|/ {
+          n=0
+          for (i=1;i<=NF;i++){
+            if ($i ~ /^[0-9]+(\.[0-9]+)?$/) {
+              n++
+              if (n==1) la=$i
+              else if (n==2) lm=$i
+              else if (n==3) p2=$i
+              else if (n==4) p10=$i
+            }
+          }
+        }
+        END { if (la=="") exit 1; printf "%s\t%s\t%s\t%s\n", la, lm, p2, p10 }
+      ' "$tmp_rd" 2>/dev/null || true)
+      if [ -n "$row" ]; then
+        rndwr_latavg=$(printf '%s' "$row" | awk -F'\t' '{print $1}')
+        rndwr_latmax=$(printf '%s' "$row" | awk -F'\t' '{print $2}')
+        rndwr_pct2=$(printf '%s' "$row" | awk -F'\t' '{print $3}')
+        rndwr_pct10=$(printf '%s' "$row" | awk -F'\t' '{print $4}')
+      fi
+    fi
+ 
+    if [ -z "$rndrd_latavg" ]; then
+      row=$(awk '
+        BEGIN { inlat=0; la=""; lm=""; p2=""; p10="" }
+        /^Tiotest latency results/ { inlat=1; next }
+        inlat==1 && $0 ~ /^\|/ && $0 ~ /|[[:space:]]*Read[[:space:]]*\|/ {
+          n=0
+          for (i=1;i<=NF;i++){
+            if ($i ~ /^[0-9]+(\.[0-9]+)?$/) {
+              n++
+              if (n==1) la=$i
+              else if (n==2) lm=$i
+              else if (n==3) p2=$i
+              else if (n==4) p10=$i
+            }
+          }
+        }
+        END { if (la=="") exit 1; printf "%s\t%s\t%s\t%s\n", la, lm, p2, p10 }
+      ' "$tmp_rd" 2>/dev/null || true)
+      if [ -n "$row" ]; then
+        rndrd_latavg=$(printf '%s' "$row" | awk -F'\t' '{print $1}')
+        rndrd_latmax=$(printf '%s' "$row" | awk -F'\t' '{print $2}')
+        rndrd_pct2=$(printf '%s' "$row" | awk -F'\t' '{print $3}')
+        rndrd_pct10=$(printf '%s' "$row" | awk -F'\t' '{print $4}')
+      fi
+    fi
+  fi
+ 
+  # ---------------- IOPS estimation ----------------
+  if [ -n "$bs" ] && [ "$bs" -gt 0 ] 2>/dev/null; then
+    if [ -n "$rndwr_mbps" ]; then
+      rndwr_iops=$(awk -v mbps="$rndwr_mbps" -v b="$bs" 'BEGIN{ if (b>0) printf "%.0f", (mbps*1024*1024)/b }' 2>/dev/null)
+    fi
+    if [ -n "$rndrd_mbps" ]; then
+      rndrd_iops=$(awk -v mbps="$rndrd_mbps" -v b="$bs" 'BEGIN{ if (b>0) printf "%.0f", (mbps*1024*1024)/b }' 2>/dev/null)
+    fi
+  fi
+ 
+  # ---------------- Emit metrics (8 columns) ----------------
+  tiotest_metrics_append "$metrics" "rndwr" "$tt" "$rndwr_mbps" "$rndwr_iops" \
+    "$rndwr_latavg" "$rndwr_latmax" "$rndwr_pct2" "$rndwr_pct10"
+ 
+  tiotest_metrics_append "$metrics" "rndrd" "$tt" "$rndrd_mbps" "$rndrd_iops" \
+    "$rndrd_latavg" "$rndrd_latmax" "$rndrd_pct2" "$rndrd_pct10"
+ 
+  rm -f "$tmp_both" "$tmp_wr" "$tmp_rd" 2>/dev/null || true
+ 
+  # Success if we got rndwr or rndrd
+  [ -n "$rndwr_mbps" ] && return 0
+  [ -n "$rndrd_mbps" ] && return 0
+  return 1
+}
+
+# --- Tiotest baseline format support (suite=... threads=... metric=... baseline=... goal=... op=...) ---
+perf_tiotest_baseline_lookup_kv() {
+  f=$1; suite=$2; thr=$3; metric=$4
+  # prints: "baseline op goal" or empty
+  awk -v s="$suite" -v t="$thr" -v m="$metric" '
+    {
+      sv=""; tv=""; mv=""; b=""; g=""; o="";
+      for (i=1; i<=NF; i++) {
+        split($i, a, "=");
+        if (a[1]=="suite") sv=a[2];
+        else if (a[1]=="threads") tv=a[2];
+        else if (a[1]=="metric") mv=a[2];
+        else if (a[1]=="baseline") b=a[2];
+        else if (a[1]=="goal") g=a[2];
+        else if (a[1]=="op") o=a[2];
+      }
+      if (sv==s && tv==t && mv==m) {
+        print b, o, g;
+        exit;
+      }
+    }
+  ' "$f"
+}
+
+perf_tiotest_baseline_prefix() {
+  suite=$1
+  thr=$2
+  metric=$3
+  echo "${suite}.${thr}.${metric}"
+}
+
+# Tiotest-specific gating wrapper.
+# Purpose: isolate tiotest gating logic from sysbench helpers to avoid regressions.
+# Contract: returns 0=PASS, 1=FAIL, 2=NO_BASELINE/NO_AVG style (same shape as sysbench wrapper).
+perf_tiotest_gate_eval_line_safe() {
+  f=$1
+  suite=$2
+  thr=$3
+  metric=$4
+  avg=$5
+  delta=$6
+
+  if [ -z "$avg" ]; then
+    echo "status=NO_AVG baseline=NA goal=NA op=NA score_pct=NA key=NA"
+    return 2
+  fi
+
+  prefix=$(perf_tiotest_baseline_prefix "$suite" "$thr" "$metric")
+
+  base=$(perf_baseline_get_value "$f" "${prefix}.baseline")
+  goal=$(perf_baseline_get_value "$f" "${prefix}.goal")
+  op=$(perf_baseline_get_value "$f" "${prefix}.op")
+
+  if [ -z "$base" ] || [ -z "$op" ] || [ "$base" = "__FILL_ME__" ]; then
+    echo "status=NO_BASELINE baseline=NA goal=NA op=NA score_pct=NA key=${prefix}"
+    return 2
+  fi
+
+  # If goal missing, derive from baseline and delta (best-effort).
+  if [ -z "$goal" ] || [ "$goal" = "__FILL_ME__" ]; then
+    # delta default to 0 if empty/non-numeric
+    case "$delta" in
+      ""|*[!0-9.]*)
+        delta=0
+        ;;
+    esac
+
+    case "$op" in
+      ">="|">")
+        goal=$(awk -v b="$base" -v d="$delta" 'BEGIN{ printf "%.6f", (b+0)*(1.0-(d+0)) }' 2>/dev/null)
+        ;;
+      "<="|"<")
+        goal=$(awk -v b="$base" -v d="$delta" 'BEGIN{ printf "%.6f", (b+0)*(1.0+(d+0)) }' 2>/dev/null)
+        ;;
+      "="|"==")
+        goal=$base
+        ;;
+      *)
+        echo "status=BAD_OP baseline=$base goal=NA op=$op score_pct=NA key=${prefix}"
+        return 2
+        ;;
+    esac
+  fi
+
+  if [ -z "$goal" ]; then
+    echo "status=NO_BASELINE baseline=$base goal=NA op=$op score_pct=NA key=${prefix}"
+    return 2
+  fi
+
+  score=$(awk -v a="$avg" -v b="$base" 'BEGIN{ if ((b+0)>0) printf "%.1f", ((a+0)/(b+0))*100; else print "NA" }' 2>/dev/null)
+
+  fail=0
+  case "$op" in
+    ">=") awk -v a="$avg" -v g="$goal" 'BEGIN{exit ((a+0) >= (g+0))?0:1}' || fail=1 ;;
+    "<=") awk -v a="$avg" -v g="$goal" 'BEGIN{exit ((a+0) <= (g+0))?0:1}' || fail=1 ;;
+    ">")  awk -v a="$avg" -v g="$goal" 'BEGIN{exit ((a+0) >  (g+0))?0:1}' || fail=1 ;;
+    "<")  awk -v a="$avg" -v g="$goal" 'BEGIN{exit ((a+0) <  (g+0))?0:1}' || fail=1 ;;
+    "="|"==") awk -v a="$avg" -v g="$goal" 'BEGIN{exit ((a+0) == (g+0))?0:1}' || fail=1 ;;
+    *)
+      echo "status=BAD_OP baseline=$base goal=$goal op=$op score_pct=$score key=${prefix}"
+      return 2
+      ;;
+  esac
+
+  if [ "$fail" -eq 0 ]; then
+    echo "status=PASS baseline=$base goal=$goal op=$op score_pct=$score key=${prefix}"
+    return 0
+  fi
+
+  echo "status=FAIL baseline=$base goal=$goal op=$op score_pct=$score key=${prefix}"
+  return 1
+}
