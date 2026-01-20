@@ -1,0 +1,102 @@
+metadata:
+  name: tiotest-performance
+  format: "Lava-Test Test Definition 1.0"
+  description: >
+    Tiotest storage performance suite (sequential + random read/write)
+    with per-iteration logs, summary averages, baseline gating (optional),
+    and latency collection (optional). Designed for Yocto / LE platforms.
+  os:
+    - linux
+  scope:
+    - performance
+    - functional
+
+params:
+  # Output (LAVA will collect everything under this dir if you add it to artifacts)
+  OUT_DIR: "./logs_Tiotest"
+
+  # Iteration controls
+  ITERATIONS: "3"
+  THREADS_LIST: "1 4"
+
+  # tiotest binary
+  TIOTEST_BIN: "tiotest"
+
+  # Storage target
+  TIOTEST_DIR: "/var/tmp/tiotest_fileio"
+  USE_RAW: "0"          # 0 => filesystem, 1 => raw block device
+  OFFSET_MB: ""         # optional (--offset-mb)
+  OFFSET_FIRST: "0"     # (--offset-first)
+
+  # Modes to run
+  MODE_LIST: "seqwr seqrd rndwr rndrd"
+
+  # Sequential parameters
+  SEQ_BLOCK_SIZE: "524288"     # 512 KB
+  SEQ_FILE_SIZE_MB: "1024"     # 1 GB per thread
+
+  # Random parameters
+  RND_BLOCK_SIZE: "4096"       # 4 KB
+  RND_FILE_SIZE_MB: "1"        # MB
+  RND_OPS: "12500"
+
+  # tiotest flags
+  # NOTE: set to "0" to ENABLE latency output and populate latency columns in metrics.
+  HIDE_LATENCY: "0"            # --hide-latency (0 => show latency, 1 => hide latency)
+  TERSE: "0"                   # --terse
+  SEQ_WRITE_PHASE: "0"         # --seq-write-phase
+  SYNC_WRITES: "0"             # --sync-writes
+  CONSISTENCY: "0"             # --consistency
+  DEBUG_LEVEL: ""              # --debug-level
+
+  # Stability / environment
+  DROP_CACHES: "1"
+  SET_PERF_GOV: "1"
+  REQUIRE_NON_TMPFS: "1"
+
+  # Baseline / gating (optional)
+  # Point this to tiotest_baseline.conf if you want PASS/FAIL gating against thresholds.
+  BASELINE_FILE: ""            # e.g. "/tmp/Runner/suites/Performance/Tiotest/tiotest_baseline.conf"
+  ALLOWED_DEVIATION: "0.10"    # used when goal missing: derived from baseline +/- delta
+
+  # Standalone mode (no init_env)
+  STANDALONE: "0"
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Performance/Tiotest/ || exit 0
+
+    # Run runner; it is LAVA-friendly and should not hard-fail the job.
+    - >
+      ./run.sh
+      --out-dir "$OUT_DIR"
+      --iterations "$ITERATIONS"
+      --threads-list "$THREADS_LIST"
+      --tiotest-bin "$TIOTEST_BIN"
+      --tiotest-dir "$TIOTEST_DIR"
+      --use-raw "$USE_RAW"
+      --offset-mb "$OFFSET_MB"
+      --offset-first "$OFFSET_FIRST"
+      --mode-list "$MODE_LIST"
+      --seq-block "$SEQ_BLOCK_SIZE"
+      --seq-file-mb "$SEQ_FILE_SIZE_MB"
+      --rnd-block "$RND_BLOCK_SIZE"
+      --rnd-file-mb "$RND_FILE_SIZE_MB"
+      --rnd-ops "$RND_OPS"
+      --hide-latency "$HIDE_LATENCY"
+      --terse "$TERSE"
+      --seq-write-phase "$SEQ_WRITE_PHASE"
+      --sync-writes "$SYNC_WRITES"
+      --consistency "$CONSISTENCY"
+      --debug-level "$DEBUG_LEVEL"
+      --drop-caches "$DROP_CACHES"
+      --set-perf-gov "$SET_PERF_GOV"
+      --require-non-tmpfs "$REQUIRE_NON_TMPFS"
+      --baseline "$BASELINE_FILE"
+      --delta "$ALLOWED_DEVIATION"
+      --standalone "$STANDALONE"
+      || true
+
+    # Emit result to LAVA (expects Tiotest.res in current directory)
+    - $REPO_PATH/Runner/utils/send-to-lava.sh Tiotest.res
