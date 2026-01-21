@@ -255,16 +255,18 @@ log_info "FILEIO dir=$FILEIO_DIR total=$FILEIO_TOTAL_SIZE blk=$FILEIO_BLOCK_SIZE
 perf_clock_sanity_warn 2>/dev/null || true
 
 # ---------------- deps check ----------------
-deps_list="sysbench awk sed grep date mkfifo tee"
 if [ -n "${TASKSET_CPU_LIST:-}" ]; then
-  deps_list="$deps_list taskset"
-fi
-
-# Use single call (no loop)
-if ! check_dependencies "$deps_list"; then
-  log_skip "$TESTNAME SKIP - missing one or more dependencies: $deps_list"
-  echo "$TESTNAME SKIP" >"$RES_FILE"
-  exit 0
+  if ! check_dependencies sysbench awk sed grep date mkfifo tee taskset; then
+    log_skip "$TESTNAME SKIP - missing one or more dependencies"
+    echo "$TESTNAME SKIP" >"$RES_FILE"
+    exit 0
+  fi
+else
+  if ! check_dependencies sysbench awk sed grep date mkfifo tee; then
+    log_skip "$TESTNAME SKIP - missing one or more dependencies"
+    echo "$TESTNAME SKIP" >"$RES_FILE"
+    exit 0
+  fi
 fi
 
 set_performance_governor 2>/dev/null || true
