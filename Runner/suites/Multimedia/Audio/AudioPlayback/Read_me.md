@@ -30,19 +30,22 @@ This suite automates the validation of audio playback capabilities on Qualcomm L
 
 The test suite includes 10 diverse audio clip configurations covering various sample rates, bit depths, and channel configurations:
 
-Playback Config     Descriptive Name         Sample Rate    Bit Rate    Channels
-playback_config1    play_16KHz_16b_2ch       16 KHz         16-bit      2ch
-playback_config2    play_16KHz_8b_6ch        16 KHz         8-bit       6ch
-playback_config3    play_22.050KHz_8b_1ch    22.05 KHz      8-bit       1ch
-playback_config4    play_24KHz_24b_6ch       24 KHz         24-bit      6ch
-playback_config5    play_24KHz_32b_1ch       24 KHz         32-bit      1ch
-playback_config6    play_32KHz_16b_2ch       32 KHz         16-bit      2ch
-playback_config7    play_32KHz_8b_8ch        32 KHz         8-bit       8ch
-playback_config8    play_44.1KHz_16b_1ch     44.1 KHz       16-bit      1ch
-playback_config9    play_48KHz_8b_2ch        48 KHz         8-bit       2ch
-playback_config10   play_8KHz_8b_1ch         8 KHz          8-bit       1ch
+```  
+| Config   | Config Name       | Sample Rate | Bit Rate | Channels |
+|----------|-------------------|-------------|----------|----------|
+| Config01 | playback_config1  | 8 KHz       | 8-bit    | 1ch      |
+| Config02 | playback_config2  | 16 KHz      | 8-bit    | 6ch      |
+| Config03 | playback_config3  | 16 KHz      | 16-bit   | 2ch      |
+| Config04 | playback_config4  | 22.05 KHz   | 8-bit    | 1ch      |
+| Config05 | playback_config5  | 24 KHz      | 24-bit   | 6ch      |
+| Config06 | playback_config6  | 24 KHz      | 32-bit   | 1ch      |
+| Config07 | playback_config7  | 32 KHz      | 8-bit    | 8ch      |
+| Config08 | playback_config8  | 32 KHz      | 16-bit   | 2ch      |
+| Config09 | playback_config9  | 44.1 KHz    | 16-bit   | 1ch      |
+| Config10 | playback_config10 | 48 KHz      | 8-bit    | 2ch      |
+```   
 
-Coverage Summary:
+**Coverage Summary:**
 - Sample Rates: 8 KHz, 16 KHz, 22.05 KHz, 24 KHz, 32 KHz, 44.1 KHz, 48 KHz
 - Bit Depths: 8-bit, 16-bit, 24-bit, 32-bit
 - Channel Configurations: 1ch (Mono), 2ch (Stereo), 6ch (5.1 Surround), 8ch (7.1 Surround)
@@ -78,9 +81,14 @@ Runner/
 └── suites/
     └── Multimedia/
         └── Audio/
-            ├── AudioPlayback/
+            └── AudioPlayback/
                 ├── run.sh
-                └── Read_me.md
+                ├── Read_me.md
+                ├── AudioPlayback.yaml                
+                ├── AudioPlayback_Config01.yaml
+                ├── AudioPlayback_Config02.yaml
+                ├── ...
+                └── AudioPlayback_Config10.yaml
 ```
 
 ## Usage
@@ -182,10 +190,17 @@ cd Runner/suites/Multimedia/Audio/AudioPlayback
 # Provide JUnit output and disable dmesg scan
 ./run.sh --junit results.xml --no-dmesg
 
-# CI/LAVA workflow: Generate unique result files for each test
-./run.sh --clip-name "playback_config1" --res-suffix "Config1" --audio-clips-path /home/AudioClips/ --no-extract-assets
-./run.sh --clip-name "playback_config7" --res-suffix "Config7" --audio-clips-path /home/AudioClips/ --no-extract-assets
-# This generates AudioPlayback_Config1.res and AudioPlayback_Config7.res (no overwriting)
+# CI/LAVA workflow: Using pre-configured YAML files
+# Each configuration has its own YAML file in the same directory as run.sh
+# These can be run directly by LAVA as separate test cases
+
+# Method 1: Using the pre-configured YAML files directly (recommended for LAVA)
+# LAVA will execute these automatically based on the YAML definitions
+
+# Method 2: Using run.sh with specific configurations
+./run.sh --clip-name "playback_config1" --res-suffix "Config01" --audio-clips-path /home/AudioClips/ --no-extract-assets
+./run.sh --clip-name "playback_config7" --res-suffix "Config07" --audio-clips-path /home/AudioClips/ --no-extract-assets
+# This generates AudioPlayback_Config01.res and AudioPlayback_Config07.res (no overwriting)
 
 
 
@@ -193,10 +208,12 @@ Environment Variables:
 Variable	             Description	                                   Default
 AUDIO_BACKEND	         Selects backend: pipewire or pulseaudio	       auto-detect
 SINK_CHOICE	             Playback sink: speakers or null	               speakers
+CLIP_NAMES               Test specific clips (e.g., "playback_config1 playback_config2")    playback_config1
+CLIP_FILTER              Filter clips by pattern (e.g., "48KHz" or "16b" or "2ch")          unset
 FORMATS	                 Audio formats: e.g. wav	                       wav
-DURATIONS	             Playback durations: short, medium, long	       short
+DURATIONS	             Playback durations: short, medium, long (legacy mode only)    ""
 LOOPS	                 Number of playback loops	                       1
-TIMEOUT	                 Playback timeout per loop (e.g., 15s, 0=none)     0
+TIMEOUT	                 Playback timeout per loop (e.g., 15s, 0=none)     "10s"
 STRICT	                 Enable strict mode (fail on any error)            0
 DMESG_SCAN	             Scan dmesg for errors after playback	           1
 VERBOSE	                 Enable verbose logging                            0
@@ -208,6 +225,7 @@ SSID                     Wi-Fi SSID for network connection                 unset
 PASSWORD                 Wi-Fi password for network connection             unset
 NET_PROBE_ROUTE_IP       IP used for route probing (default: 1.1.1.1)      1.1.1.1
 NET_PING_HOST            Host used for ping reachability check             8.8.8.8
+RES_SUFFIX               Suffix for unique result file and log directory   unset
 
 
 CLI Options
@@ -217,7 +235,7 @@ Option	                    Description
 --clip-name <names>         Test specific clips using playback_config1-playback_config10 or descriptive names (space-separated)
 --clip-filter <patterns>    Filter clips by sample rate, bit rate, or channels (space-separated patterns)
 --formats	                Audio formats (space/comma separated): e.g. wav 
---durations	                Playback durations: short, medium, long
+--durations	                Playback durations: short, medium, long (legacy mode only)
 --loops	                    Number of playback loops
 --timeout	                Playback timeout per loop (e.g., 15s)
 --strict	                Enable strict mode
@@ -225,7 +243,7 @@ Option	                    Description
 --no-extract-assets         Disable asset extraction entirely (skips all asset operations)
 --enable-network-download   Enable network operations to download missing audio files (default: disabled)
 --audio-clips-path <path>   Custom location for audio clips (for CI with pre-staged clips)
---res-suffix <suffix>       Suffix for unique result file and log directory (e.g., "Config1" generates AudioPlayback_Config1.res and results/AudioPlayback_Config1/)
+--res-suffix <suffix>       Suffix for unique result file and log directory (e.g., "Config01" generates AudioPlayback_Config01.res and results/AudioPlayback_Config01/)
 --junit <file.xml>	        Write JUnit XML output
 --verbose	                Enable verbose logging
 --help	                    Show usage instructions
@@ -318,8 +336,8 @@ sh-5.3# ./run.sh --no-extract-assets --clip-name "playback_config99"
 
 **Example 6: CI/LAVA workflow with unique result files**
 ```
-sh-5.3# ./run.sh --clip-name "playback_config1" --res-suffix "Config1" --audio-clips-path /home/AudioClips/ --no-extract-assets
-[INFO] 2026-01-22 17:46:33 - Using unique result file: ./AudioPlayback_Config1.res
+sh-5.3# ./run.sh --clip-name "playback_config1" --res-suffix "Config01" --audio-clips-path /home/AudioClips/ --no-extract-assets
+[INFO] 2026-01-22 17:46:33 - Using unique result file: ./AudioPlayback_Config01.res
 [INFO] 2026-01-22 17:46:33 - ---------------- Starting AudioPlayback ----------------
 [INFO] 2026-01-22 17:46:33 - Using clip discovery mode
 [INFO] 2026-01-22 17:46:33 - Discovered 1 clips to test
@@ -327,20 +345,20 @@ sh-5.3# ./run.sh --clip-name "playback_config1" --res-suffix "Config1" --audio-c
 [PASS] 2026-01-22 17:47:04 - [play_16KHz_16b_2ch] loop 1 OK (rc=0, 30s)
 [PASS] 2026-01-22 17:47:04 - AudioPlayback PASS
 
-sh-5.3# cat AudioPlayback_Config1.res
+sh-5.3# cat AudioPlayback_Config01.res
 AudioPlayback PASS
 
-sh-5.3# ./run.sh --clip-name "playback_config7" --res-suffix "Config7" --audio-clips-path /home/AudioClips/ --no-extract-assets
-[INFO] 2026-01-22 17:48:34 - Using unique result file: ./AudioPlayback_Config7.res
+sh-5.3# ./run.sh --clip-name "playback_config7" --res-suffix "Config07" --audio-clips-path /home/AudioClips/ --no-extract-assets
+[INFO] 2026-01-22 17:48:34 - Using unique result file: ./AudioPlayback_Config07.res
 [PASS] 2026-01-22 17:49:05 - AudioPlayback PASS
 
-sh-5.3# cat AudioPlayback_Config7.res
+sh-5.3# cat AudioPlayback_Config07.res
 AudioPlayback PASS
 
 # Both result files exist without overwriting
 sh-5.3# ls -1 AudioPlayback*.res
-AudioPlayback_Config1.res
-AudioPlayback_Config7.res
+AudioPlayback_Config01.res
+AudioPlayback_Config07.res
 ```
 
 Results:
