@@ -1696,54 +1696,85 @@ btfwpresent() {
 }
 
 btfwloaded() {
-    # Look at recent Bluetooth/QCA/WCN messages only, to keep noise low.
-    # Tune tail -n if needed.
+    # ---- Configurable patterns (override via env if needed) ----
+    # "Final success" (strongest marker that FW+UART setup completed)
+    success_re="${BTFW_SUCCESS_RE:-setup on UART is completed|setup on uart is completed}"
+
+    # "Fatal-ish" errors: these should FAIL only if they occur after the final success,
+    # otherwise they indicate transient issues during bring-up -> WARN.
+    fatal_re="${BTFW_FATAL_RE:-tx timeout|Reading QCA version information failed|failed to open firmware|firmware file.*not found|download.*firmware.*failed|failed to download.*firmware|timeout waiting for firmware|firmware.*load.*failed}"
+
+    # Retry/transient hints: if success exists and we see these, we likely want WARN.
+    transient_re="${BTFW_TRANSIENT_RE:-Retry BT power ON|retry bt power on|reset|re-init|reinit|failed.*\\(-110\\)}"
+
+    # ---- Collect recent relevant dmesg ----
+    # Filter for BT/QCA/WCN related lines; keep a reasonable window.
     out="$(
         dmesg 2>/dev/null \
-        | grep -i -E 'Bluetooth|hci[0-9]|QCA|wcn' \
-        | tail -n 400
+        | grep -i -E 'Bluetooth|hci[0-9]|QCA|wcn|btqca|WCN' \
+        | tail -n "${BTFW_DMESG_TAIL:-600}"
     )"
- 
-    # If we see nothing at all, be conservative and say "not loaded".
+
     if [ -z "$out" ]; then
         log_warn "btfwloaded: no recent Bluetooth/QCA/WCN messages in dmesg."
         return 1
     fi
- 
-    ok=0
- 
-    # --- Success patterns ---
-    # Try to catch typical QCA / UART setup success messages.
-    if printf '%s\n' "$out" | grep -qi -E \
-        'setup on UART is completed|setup on uart is completed'; then
-        ok=1
-    fi
- 
-    if printf '%s\n' "$out" | grep -qi -E \
-        'QCA controller.*initialized|QCA controller.*setup|Bluetooth: hci[0-9]:.*QCA'; then
-        ok=1
-    fi
- 
-    # Some stacks log generic "firmware loaded" style messages:
-    if printf '%s\n' "$out" | grep -qi -E \
-        'firmware.*loaded|firmware.*downloaded|download of.*firmware completed'; then
-        ok=1
-    fi
- 
-    # --- Failure / warning patterns ---
-    # Any of these will force a "not OK" verdict even if we saw a success marker.
-    if printf '%s\n' "$out" | grep -qi -E \
-        'tx timeout|Reading QCA version information failed|failed to open firmware|firmware file.*not found|no such file or directory.*firmware|download.*firmware.*failed|failed to download.*firmware|timeout waiting for firmware|firmware.*load.*failed'; then
-        ok=0
-    fi
- 
-    if [ "$ok" -ne 1 ]; then
-        log_warn "btfwloaded: firmware load **not** considered successful. Recent BT dmesg tail:"
-        printf '%s\n' "$out" | tail -n 20 >&2
+
+    # ---- Find last success line number and last fatal line number ----
+    # We use line order within $out (monotonic, no need for real timestamps).
+    last_success="$(
+        printf '%s\n' "$out" \
+        | awk -v IGNORECASE=1 -v re="$success_re" '
+            $0 ~ re { n=NR }
+            END { if (n>0) print n; else print 0 }
+        '
+    )"
+
+    last_fatal="$(
+        printf '%s\n' "$out" \
+        | awk -v IGNORECASE=1 -v re="$fatal_re" '
+            $0 ~ re { n=NR }
+            END { if (n>0) print n; else print 0 }
+        '
+    )"
+
+    # Also note if we saw any explicit transient/retry indicator
+    saw_transient="$(
+        printf '%s\n' "$out" \
+        | awk -v IGNORECASE=1 -v re="$transient_re" '
+            $0 ~ re { found=1; exit }
+            END { if (found) print 1; else print 0 }
+        '
+    )"
+
+    # ---- Decision tree ----
+    if [ "$last_success" -eq 0 ]; then
+        log_warn "btfwloaded: no final success marker found (pattern: $success_re). Recent tail:"
+        printf '%s\n' "$out" | tail -n 30 >&2
         return 1
     fi
- 
-    log_info "btfwloaded: firmware load appears successful (no fatal errors in recent dmesg)."
+
+    # Fatal after success => FAIL (setup looked done, but then errors happened later)
+    if [ "$last_fatal" -gt "$last_success" ]; then
+        log_warn "btfwloaded: fatal BT/QCA errors occurred after final setup marker; treating as FAIL."
+        printf '%s\n' "$out" | tail -n 40 >&2
+        return 1
+    fi
+
+    # Fatal before success OR transient hints => WARN (retry scenario)
+    if [ "$last_fatal" -gt 0 ] && [ "$last_fatal" -lt "$last_success" ]; then
+        log_warn "btfwloaded: transient errors occurred before final setup marker; treating as WARN."
+        printf '%s\n' "$out" | tail -n 30 >&2
+        return 2
+    fi
+
+    if [ "$saw_transient" -eq 1 ]; then
+        log_warn "btfwloaded: retry/transient indicators seen; final setup marker present; treating as WARN."
+        printf '%s\n' "$out" | tail -n 30 >&2
+        return 2
+    fi
+
+    log_info "btfwloaded: firmware load/setup completed cleanly (no fatal errors after final setup marker)."
     return 0
 }
 

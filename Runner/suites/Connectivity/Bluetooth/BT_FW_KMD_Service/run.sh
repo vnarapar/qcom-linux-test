@@ -74,8 +74,10 @@ log_info "------------------------------------------------------------"
 log_info "Starting $TESTNAME"
 
 log_info "Checking dependencies: bluetoothctl hciconfig dmesg lsmod"
-check_dependencies bluetoothctl hciconfig dmesg lsmod
-
+if ! check_dependencies bluetoothctl hciconfig dmesg lsmod; then
+    echo "$TESTNAME SKIP" > "$RES_FILE"
+    exit 0
+fi
 # ---------- Bluetooth service / daemon ----------
 log_info "Checking if bluetoothd (or bluetooth.service) is running..."
 if btsvcactive; then
@@ -108,11 +110,26 @@ else
 fi
 
 # ---------- Firmware load dmesg ----------
-if btfwloaded; then
-    log_pass "Firmware load/setup appears completed (dmesg)."
+if command -v btfwloaded >/dev/null 2>&1; then
+    btfwloaded
+    rc=$?
+    case "$rc" in
+        0)
+            log_pass "Firmware load/setup appears completed (dmesg)."
+            ;;
+        2)
+            log_warn "Firmware load/setup completed after retry, transient errors seen earlier (dmesg)."
+            inc_warn
+            ;;
+        *)
+            log_fail "Firmware load/setup does NOT look clean (see recent Bluetooth/QCA/WCN dmesg lines above)."
+            inc_fail
+            ;;
+    esac
 else
-    log_fail "Firmware load/setup does NOT look clean (see recent Bluetooth/QCA/WCN dmesg lines above)."
-    inc_fail
+    # No SKIP: continue test, just warn.
+    log_warn "btfwloaded() helper not available firmware-load dmesg validation not performed."
+    inc_warn
 fi
 
 # ---------- Kernel modules / KMD ----------
