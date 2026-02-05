@@ -27,22 +27,25 @@ This suite automates the validation of audio recording capabilities on Qualcomm 
 
 The test suite includes 10 diverse audio record configurations covering various sample rates and channel configurations:
 
-Config           Descriptive Name    Sample Rate  Channels 
-record_config1   record_8KHz_1ch     8 KHz        1ch
-record_config2   record_16KHz_1ch    16 KHz       1ch
-record_config3   record_16KHz_2ch    16 KHz       2ch
-record_config4   record_24KHz_1ch    24 KHz       1ch
-record_config5   record_32KHz_2ch    32 KHz       2ch
-record_config6   record_44.1KHz_2ch  44.1 KHz     2ch
-record_config7   record_48KHz_2ch    48 KHz       2ch
-record_config8   record_48KHz_6ch    48 KHz       6ch
-record_config9   record_96KHz_2ch    96 KHz       2ch
-record_config10  record_96KHz_6ch    96 KHz       6ch
+```  
+| Config   | Config Name      | Sample Rate | Channels |
+|----------|------------------|-------------|----------|
+| Config01 | record_config1   | 8 KHz       | 1ch      |
+| Config02 | record_config2   | 16 KHz      | 1ch      |
+| Config03 | record_config3   | 16 KHz      | 2ch      |
+| Config04 | record_config4   | 24 KHz      | 1ch      |
+| Config05 | record_config5   | 32 KHz      | 2ch      |
+| Config06 | record_config6   | 44.1 KHz    | 2ch      |
+| Config07 | record_config7   | 48 KHz      | 2ch      |
+| Config08 | record_config8   | 48 KHz      | 6ch      |
+| Config09 | record_config9   | 96 KHz      | 2ch      |
+| Config10 | record_config10  | 96 KHz      | 6ch      |
+```   
 
 **Coverage Summary:**
-- **Sample Rates**: 8 KHz, 16 KHz, 24 KHz, 32 KHz, 44.1 KHz, 48 KHz, 96 KHz
-- **Channel Configurations**: 1ch (Mono), 2ch (Stereo), 6ch (5.1 Surround)
-- **Total Configurations**: 10 unique audio format combinations
+- Sample Rates: 8 KHz, 16 KHz, 24 KHz, 32 KHz, 44.1 KHz, 48 KHz, 96 KHz
+- Channel Configurations: 1ch (Mono), 2ch (Stereo), 6ch (5.1 Surround)
+- Total Configurations: 10 unique audio format combinations
 
 ## Prerequisites
 
@@ -75,9 +78,14 @@ Runner/
 └── suites/
     └── Multimedia/
         └── Audio/
-            ├── AudioRecord/
+            └── AudioRecord/
                 ├── run.sh         
-                └── Read_me.md      
+                ├── Read_me.md
+                ├── AudioRecord.yaml
+                ├── AudioRecord_Config01.yaml
+                ├── AudioRecord_Config02.yaml
+                ├── ...
+                └── AudioRecord_Config10.yaml
 ```
 
 ## Usage
@@ -148,18 +156,27 @@ cd Runner/suites/Multimedia/Audio/AudioRecord
 # Provide JUnit output and disable dmesg scan
 ./run.sh --junit results.xml --no-dmesg
 
-# CI/LAVA workflow: Generate unique result files for each test
-./run.sh --config-name "record_config1" --res-suffix "Config1" --record-seconds 10s
-./run.sh --config-name "record_config7" --res-suffix "Config7" --record-seconds 10s
+# CI/LAVA workflow: Using pre-configured YAML files
+# Each configuration has its own YAML file in the same directory as run.sh
+# These can be run directly by LAVA as separate test cases
+
+# Method 1: Using the pre-configured YAML files directly (recommended for LAVA)
+# LAVA will execute these automatically based on the YAML definitions
+
+# Method 2: Using run.sh with specific configurations
+./run.sh --config-name "record_config1" --res-suffix "Config01" --record-seconds 10s
+./run.sh --config-name "record_config7" --res-suffix "Config07" --record-seconds 10s
 ./run.sh --config-name "record_config10" --res-suffix "Config10" --record-seconds 10s
-# This generates AudioRecord_Config1.res, AudioRecord_Config7.res, and AudioRecord_Config10.res (no overwriting)
+# This generates AudioRecord_Config01.res, AudioRecord_Config07.res, and AudioRecord_Config10.res (no overwriting)
 
 
 Environment Variables:
 Variable	      Description	                                                  Default
 AUDIO_BACKEND	  Selects backend: pipewire or pulseaudio	                      auto-detect
 SOURCE_CHOICE	  Recording source: mic or null                                   mic
-DURATIONS	      Recording durations: short, medium, long(legacy matrix mode)    short
+CONFIG_NAMES      Test specific configs (e.g., "record_config1 record_config2")   record_config1
+CONFIG_FILTER     Filter configs by pattern (e.g., "48KHz" or "2ch")              unset
+DURATIONS	      Recording durations: short, medium, long (legacy mode only)     ""
 RECORD_SECONDS	  Number of seconds to record (e.g., 5s, 10s)                     30s
 LOOPS	          Number of recording loops	                                      1
 TIMEOUT	          Recording timeout per loop (e.g., 15s, 0=none)                  0
@@ -167,6 +184,7 @@ STRICT	          Strict mode (0=disabled, 1=enabled, fail on any error)	      0
 DMESG_SCAN	      Scan dmesg for errors after recording	                          1
 VERBOSE	          Enable verbose logging	                                      0
 JUNIT_OUT	      Path to write JUnit XML output	                              unset
+RES_SUFFIX        Suffix for unique result file and log directory                 unset
 
 
 CLI Options:
@@ -176,12 +194,12 @@ Option	                      Description
 --config-name <names>         Test specific configs using record_config1-record_config10 or descriptive names (space-separated)
 --config-filter <patterns>    Filter configs by sample rate or channels (space-separated patterns)
 --record-seconds <duration>   Number of seconds to record (e.g., 5s, 10s)
---durations	                  Recording durations: short, medium, long (legacy matrix mode only)
+--durations	                  Recording durations: short, medium, long (legacy mode only)
 --loops	                      Number of recording loops
 --timeout	                  Recording timeout per loop (e.g., 15s)
 --strict [0|1]                Enable strict mode (0=disabled, 1=enabled)
 --no-dmesg	                  Disable dmesg scan
---res-suffix <suffix>         Suffix for unique result file and log directory (e.g., "Config1" generates AudioRecord_Config1.res and results/AudioRecord_Config1/)
+--res-suffix <suffix>         Suffix for unique result file and log directory (e.g., "Config01" generates AudioRecord_Config01.res and results/AudioRecord_Config01/)
 --junit <file.xml>            Write JUnit XML output
 --verbose	                  Enable verbose logging
 --help	                      Show usage instructions
@@ -267,8 +285,8 @@ sh-5.3# ./run.sh --config-name "record_config99"
 
 **Example 6: CI/LAVA workflow with unique result files**
 ```
-sh-5.3# ./run.sh --config-name "record_config1" --res-suffix "Config1" --record-seconds 10s
-[INFO] 2026-01-12 07:14:09 - Using unique result file: ./AudioRecord_Config1.res
+sh-5.3# ./run.sh --config-name "record_config1" --res-suffix "Config01" --record-seconds 10s
+[INFO] 2026-01-12 07:14:09 - Using unique result file: ./AudioRecord_Config01.res
 [INFO] 2026-01-12 07:14:09 - ---------------- Starting AudioRecord ----------------
 [INFO] 2026-01-12 07:14:09 - Using config discovery mode
 [INFO] 2026-01-12 07:14:09 - Discovered 1 configs to test
@@ -276,20 +294,20 @@ sh-5.3# ./run.sh --config-name "record_config1" --res-suffix "Config1" --record-
 [PASS] 2026-01-12 07:14:19 - [record_8KHz_1ch] loop 1 OK (rc=0, 10s, bytes=162462)
 [PASS] 2026-01-12 07:14:19 - AudioRecord PASS
 
-sh-5.3# cat AudioRecord_Config1.res
+sh-5.3# cat AudioRecord_Config01.res
 AudioRecord PASS
 
-sh-5.3# ./run.sh --config-name "record_config7" --res-suffix "Config7" --record-seconds 10s
-[INFO] 2026-01-12 07:16:01 - Using unique result file: ./AudioRecord_Config7.res
+sh-5.3# ./run.sh --config-name "record_config7" --res-suffix "Config07" --record-seconds 10s
+[INFO] 2026-01-12 07:16:01 - Using unique result file: ./AudioRecord_Config07.res
 [PASS] 2026-01-12 07:16:11 - AudioRecord PASS
 
-sh-5.3# cat AudioRecord_Config7.res
+sh-5.3# cat AudioRecord_Config07.res
 AudioRecord PASS
 
 # Both result files exist without overwriting
 sh-5.3# ls -1 AudioRecord*.res
-AudioRecord_Config1.res
-AudioRecord_Config7.res
+AudioRecord_Config01.res
+AudioRecord_Config07.res
 ```
 
 **Example 7: Testing all 10 configs with short duration**
