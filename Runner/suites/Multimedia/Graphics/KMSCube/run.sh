@@ -49,15 +49,38 @@ rm -f "$RES_FILE" "$LOG_FILE"
 log_info "-------------------------------------------------------------------"
 log_info "------------------- Starting $TESTNAME Testcase -------------------"
 
-# --- Dependencies ------------------------------------------------------------
-# Note: check_dependencies returns 0 when present, non-zero if missing.
-check_dependencies kmscube || {
-    log_skip "$TESTNAME SKIP: missing dependencies: kmscube"
-    echo "$TESTNAME SKIP" >"$RES_FILE"
+# ---------------------------------------------------------------------------
+# Display snapshot
+# ---------------------------------------------------------------------------
+if command -v display_debug_snapshot >/dev/null 2>&1; then
+    display_debug_snapshot "pre-display-check"
+fi
+
+# Always print modetest as part of the snapshot (best-effort).
+if command -v modetest >/dev/null 2>&1; then
+    log_info "----- modetest -M msm -ac (capped at 200 lines) -----"
+    modetest -M msm -ac 2>&1 | sed -n '1,200p' | while IFS= read -r l; do
+        [ -n "$l" ] && log_info "[modetest] $l"
+    done
+    log_info "----- End modetest -M msm -ac -----"
+else
+    log_warn "modetest not found in PATH skipping modetest snapshot."
+fi
+
+have_connector=0
+if command -v display_connected_summary >/dev/null 2>&1; then
+    sysfs_summary=$(display_connected_summary)
+    if [ -n "$sysfs_summary" ] && [ "$sysfs_summary" != "none" ]; then
+        have_connector=1
+        log_info "Connected display (sysfs): $sysfs_summary"
+    fi
+fi
+
+if [ "$have_connector" -eq 0 ]; then
+    log_warn "No connected DRM display found, skipping ${TESTNAME}."
+    echo "${TESTNAME} SKIP" >"$RES_FILE"
     exit 0
-}
-KMSCUBE_BIN="$(command -v kmscube 2>/dev/null || true)"
-log_info "Using kmscube: ${KMSCUBE_BIN:-<not found>}"
+fi
 
 # --- Basic DRM availability guard -------------------------------------------
 set -- /dev/dri/card* 2>/dev/null
@@ -66,44 +89,94 @@ if [ ! -e "$1" ]; then
     echo "$TESTNAME SKIP" >"$RES_FILE"
     exit 0
 fi
+# --- Dependencies ------------------------------------------------------------
+# With patched check_dependencies(): ask for return code instead of exit
+if ! CHECK_DEPS_NO_EXIT=1 check_dependencies kmscube; then
+    log_skip "$TESTNAME SKIP: missing dependencies: kmscube"
+    echo "$TESTNAME SKIP" >"$RES_FILE"
+    exit 0
+fi
 
-# --- If Weston is running, stop it so KMS has control ------------------------
+KMSCUBE_BIN="$(command -v kmscube 2>/dev/null || true)"
+log_info "Using kmscube: ${KMSCUBE_BIN:-<not found>}"
+
+# --- Track Weston state (restore at end if needed) ---------------------------
 weston_was_running=0
 if weston_is_running; then
-    weston_stop
     weston_was_running=1
 fi
-
-# --- Skip if only CPU/software renderer is active (GPU HW accel not enabled) ---
+# --- GPU acceleration gating (avoid auto/Wayland for kmscube) ----------------
+# KMSCube is a DRM/KMS test. Using "auto" can start/adopt Weston and steal DRM master.
 if command -v display_is_cpu_renderer >/dev/null 2>&1; then
-    if display_is_cpu_renderer auto; then
-        log_skip "$TESTNAME SKIP: GPU HW acceleration not enabled (CPU/software renderer detected)"
-        echo "${TESTNAME} SKIP" >"$RES_FILE"
-        exit 0
+    if display_is_cpu_renderer gbm >/dev/null 2>&1; then
+        if display_is_cpu_renderer gbm; then
+            log_skip "$TESTNAME SKIP: GPU HW acceleration not enabled (CPU/software renderer detected on GBM)"
+            echo "$TESTNAME SKIP" >"$RES_FILE"
+            exit 0
+        fi
+    else
+        log_warn "display_is_cpu_renderer gbm not supported, falling back to auto (may touch Wayland/Weston)."
+        if display_is_cpu_renderer auto; then
+            log_skip "$TESTNAME SKIP: GPU HW acceleration not enabled (CPU/software renderer detected)"
+            echo "$TESTNAME SKIP" >"$RES_FILE"
+            exit 0
+        fi
     fi
 else
-    log_warn "display_is_cpu_renderer helper not found and cannot enforce GPU accel gating (continuing)."
+    log_warn "display_is_cpu_renderer helper not found, cannot enforce GPU accel gating (continuing)."
 fi
 
-# --- Execute kmscube ---------------------------------------------------------
+# --- Ensure Weston is NOT running before kmscube (DRM master) -----------------
+# Stop weston after gating too, because some helpers may have started it.
+if weston_is_running; then
+    log_info "Weston is running, stopping it so kmscube can modeset (DRM master)"
+    weston_stop >/dev/null 2>&1 || true
+fi
+
+# Double-check and be strict: kmscube will fail if weston still holds DRM master.
+if weston_is_running; then
+    log_warn "Weston still running after weston_stop, kmscube may fail to set mode"
+fi
+
+# --- Execute kmscube (avoid Wayland env leakage) ------------------------------
+unset WAYLAND_DISPLAY
+# Keep XDG_RUNTIME_DIR intact for system sanity, but force GBM platform for EGL where honored.
+EGL_PLATFORM_SAVED="${EGL_PLATFORM:-}"
+export EGL_PLATFORM=gbm
+
 log_info "Running kmscube with --count=${FRAME_COUNT} ..."
 if kmscube --count="${FRAME_COUNT}" >"$LOG_FILE" 2>&1; then :; else
     rc=$?
     log_fail "$TESTNAME : Execution failed (rc=$rc) — see $LOG_FILE"
     cat "$LOG_FILE"
     echo "$TESTNAME FAIL" >"$RES_FILE"
+
+    # Restore EGL_PLATFORM
+    if [ -n "$EGL_PLATFORM_SAVED" ]; then
+        export EGL_PLATFORM="$EGL_PLATFORM_SAVED"
+    else
+        unset EGL_PLATFORM
+    fi
+
+    # Restore Weston if it was running before
     if [ "$weston_was_running" -eq 1 ]; then
         log_info "Restarting Weston after failure"
-        weston_start
+        weston_start >/dev/null 2>&1 || true
     fi
     exit 1
 fi
 
-# --- Parse 'Rendered N frames' (case-insensitive), use the last N -----------
+# Restore EGL_PLATFORM
+if [ -n "$EGL_PLATFORM_SAVED" ]; then
+    export EGL_PLATFORM="$EGL_PLATFORM_SAVED"
+else
+    unset EGL_PLATFORM
+fi
+
+# --- Parse 'Rendered N frames' (case-insensitive), use the last N ------------
 FRAMES_RENDERED="$(
     awk 'BEGIN{IGNORECASE=1}
          /Rendered[[:space:]][0-9]+[[:space:]]+frames/{
-             # capture the numeric token on that line; remember the last match
              for(i=1;i<=NF;i++) if ($i ~ /^[0-9]+$/) n=$i
              last=n
          }
@@ -120,9 +193,10 @@ if [ "$FRAMES_RENDERED" -ge "$EXPECTED_MIN" ]; then
 else
     log_fail "$TESTNAME : FAIL (rendered ${FRAMES_RENDERED} < ${EXPECTED_MIN})"
     echo "$TESTNAME FAIL" >"$RES_FILE"
+
     if [ "$weston_was_running" -eq 1 ]; then
         log_info "Restarting Weston after failure"
-        weston_start
+        weston_start >/dev/null 2>&1 || true
     fi
     exit 1
 fi
@@ -130,7 +204,7 @@ fi
 # --- Restore Weston if we stopped it -----------------------------------------
 if [ "$weston_was_running" -eq 1 ]; then
     log_info "Restarting Weston after $TESTNAME completion"
-    weston_start
+    weston_start >/dev/null 2>&1 || true
 fi
 
 log_info "------------------- Completed $TESTNAME Testcase ------------------"
