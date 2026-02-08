@@ -1002,9 +1002,16 @@ weston_start() {
 }
 
 overlay_start_weston_drm() {
-    EGL_JSON="/usr/share/glvnd/egl_vendor.d/EGL_adreno.json"
+    # Pick the first matching EGL vendor JSON without using ls|head (ShellCheck SC2012)
+    EGL_JSON=""
+    for f in /usr/share/glvnd/egl_vendor.d/*EGL_adreno.json; do
+        if [ -f "$f" ]; then
+            EGL_JSON="$f"
+            break
+        fi
+    done
  
-    if [ -f "$EGL_JSON" ]; then
+    if [ -n "$EGL_JSON" ]; then
         export __EGL_VENDOR_LIBRARY_FILENAMES="$EGL_JSON"
         log_info "Overlay EGL: using vendor JSON: $EGL_JSON"
     fi
@@ -1049,15 +1056,13 @@ overlay_start_weston_drm() {
  
     if [ -n "$sock_found" ]; then
         log_info "Overlay Weston created Wayland socket at $sock_found"
-        # We still let the caller discover/adopt the env via
-        # discover_wayland_socket_anywhere + adopt_wayland_env_from_socket.
+        # Caller can discover/adopt env via discover_wayland_socket_anywhere + adopt_wayland_env_from_socket.
         return 0
     fi
  
     log_warn "Overlay Weston did not create a Wayland socket under $XDG_RUNTIME_DIR (see $WESTON_LOG)"
     return 1
 }
-
 # Choose a socket (or try to start), adopt env, and echo chosen path.
 wayland_choose_or_start() {
     wayland_debug_snapshot "pre-choose"
