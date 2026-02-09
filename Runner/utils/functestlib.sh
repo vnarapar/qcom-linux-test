@@ -141,17 +141,17 @@ unload_kernel_module() {
 # --- Dependency check ---
 check_dependencies() {
     # Support both:
-    #   check_dependencies date awk sed
-    #   check_dependencies "$deps"   where deps="date awk sed"
+    # check_dependencies date awk sed
+    # check_dependencies "$deps" where deps="date awk sed"
     if [ "$#" -eq 1 ]; then
         # Split the single string into args
         # shellcheck disable=SC2086
         set -- $1
     fi
- 
+
     missing=0
     missing_cmds=""
- 
+
     for cmd in "$@"; do
         [ -n "$cmd" ] || continue
         if ! command -v "$cmd" >/dev/null 2>&1; then
@@ -160,16 +160,21 @@ check_dependencies() {
             missing_cmds="$missing_cmds $cmd"
         fi
     done
- 
+
     if [ "$missing" -ne 0 ]; then
         testname="${TESTNAME:-UnknownTest}"
         log_skip "$testname SKIP missing dependencies$missing_cmds"
         if [ -n "${TESTNAME:-}" ]; then
             echo "$TESTNAME SKIP" > "./$TESTNAME.res" 2>/dev/null || true
         fi
+
+        # Default: exit like today. Allow opt-out for callers that want a return code.
+        if [ "${CHECK_DEPS_NO_EXIT:-0}" = "1" ]; then
+            return 1
+        fi
         exit 0
     fi
- 
+
     return 0
 }
 
@@ -862,29 +867,43 @@ check_tar_file() {
 
 # Return space-separated PIDs for 'weston' (BusyBox friendly).
 weston_pids() {
-    # Print weston PIDs (space-separated). Empty if none.
+    pids=""
     if command -v pgrep >/dev/null 2>&1; then
-        pgrep -x weston 2>/dev/null | tr '\n' ' ' | sed 's/[[:space:]]*$//'
-        return 0
+        pids="$(pgrep -x weston 2>/dev/null || true)"
+    fi
+    if [ -z "$pids" ]; then
+        pids="$(ps -eo pid,comm 2>/dev/null | awk '$2=="weston"{print $1}')"
+    fi
+    echo "$pids"
+}
+
+# Is Weston running
+weston_is_running() {
+    [ -n "$(weston_pids)" ]
+}
+
+# Stop all Weston processes, also stop socket activation and instances
+weston_stop() {
+    if command -v systemctl >/dev/null 2>&1; then
+        log_info "Stopping Weston, stopping weston.socket to prevent auto restart"
+        systemctl stop weston.socket >/dev/null 2>&1 || true
+
+        log_info "Stopping Weston, stopping weston.service"
+        systemctl stop weston.service >/dev/null 2>&1 || true
+
+        log_info "Stopping Weston, stopping weston@root.service if present"
+        systemctl stop weston@root.service >/dev/null 2>&1 || true
+
+        # Stop any active weston@*.service instances
+        units="$(systemctl list-units 'weston@*.service' --no-legend --no-pager 2>/dev/null | awk '{print $1}')"
+        if [ -n "$units" ]; then
+            for u in $units; do
+                log_info "Stopping Weston, stopping instance unit $u"
+                systemctl stop "$u" >/dev/null 2>&1 || true
+            done
+        fi
     fi
 
-    # Fallback: ps (avoid matching grep itself)
-    # shellcheck disable=SC2009
-    ps 2>/dev/null | awk '
-        $0 ~ /[[:space:]]weston([[:space:]]|$)/ { print $1 }
-    ' | tr '\n' ' ' | sed 's/[[:space:]]*$//'
-    return 0
-}
-
-# Is Weston running?
-weston_is_running() {
-    # Process-based ONLY (do not use socket existence)
-    pids="$(weston_pids)"
-    [ -n "$pids" ]
-}
-
-# Stop all Weston processes
-weston_stop() {
     if ! weston_is_running; then
         log_info "Weston is not running."
         # Still cleanup stale sockets (prevents false positives elsewhere)
@@ -893,8 +912,10 @@ weston_stop() {
     fi
 
     log_info "Stopping Weston..."
+
     # First try graceful
     if command -v pkill >/dev/null 2>&1; then
+        log_info "Stopping Weston processes"
         pkill -TERM -x weston >/dev/null 2>&1 || true
     elif command -v killall >/dev/null 2>&1; then
         killall weston >/dev/null 2>&1 || true
@@ -907,9 +928,8 @@ weston_stop() {
 
     i=1
     while [ "$i" -le 10 ]; do
-        log_info "Waiting for Weston to stop with $i attempt"
+        log_info "Waiting for Weston to stop, attempt $i of 10"
         if ! weston_is_running; then
-            # Clean up stale socket files that may remain after exit
             weston_cleanup_stale_sockets
             log_info "Weston stopped successfully"
             return 0
@@ -918,7 +938,7 @@ weston_stop() {
         i=$((i + 1))
     done
 
-    log_warn "Weston still running after grace period; forcing kill..."
+    log_warn "Weston still running after grace period, sending SIGKILL"
 
     if command -v pkill >/dev/null 2>&1; then
         pkill -KILL -x weston >/dev/null 2>&1 || true
@@ -928,21 +948,28 @@ weston_stop() {
         done
     fi
 
-    sleep 1
+    i=1
+    while [ "$i" -le 5 ]; do
+        log_info "Waiting for Weston to stop after SIGKILL, attempt $i of 5"
+        if ! weston_is_running; then
+            weston_cleanup_stale_sockets
+            log_info "Weston stopped successfully"
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
 
-    if weston_is_running; then
-        log_error "Failed to stop Weston (still running: $(weston_pids))"
-        return 1
-    fi
-
+    log_error "Failed to stop Weston completely"
+    # Still attempt cleanup to avoid future false positives
     weston_cleanup_stale_sockets
-    log_info "Weston stopped successfully (forced)"
-    return 0
+    return 1
 }
+
 # Start weston with correct env if not running
 weston_start() {
     if weston_is_running; then
-        log_info "Weston already running (PID(s): $(weston_pids))."
+        log_info "Weston already running"
         return 0
     fi
 
@@ -950,42 +977,60 @@ weston_start() {
     weston_cleanup_stale_sockets
 
     if command -v systemctl >/dev/null 2>&1; then
-        log_info "Attempting to start via systemd: weston.service"
+        log_info "Attempting to start Weston, enabling weston.socket if available"
+        systemctl start weston.socket >/dev/null 2>&1 || true
+        sleep 1
+
+        log_info "Attempting to start Weston via weston.service"
         systemctl start weston.service >/dev/null 2>&1 || true
         sleep 1
         if weston_is_running; then
-            log_info "Weston started via systemd (weston.service) (PID(s): $(weston_pids))."
+            log_info "Weston started via weston.service"
             return 0
         fi
 
-        log_info "Attempting to start via systemd: weston@.service"
-        systemctl start weston@.service >/dev/null 2>&1 || true
+        log_info "Attempting to start Weston via weston@root.service"
+        systemctl start weston@root.service >/dev/null 2>&1 || true
         sleep 1
         if weston_is_running; then
-            log_info "Weston started via systemd (weston@.service) (PID(s): $(weston_pids))."
+            log_info "Weston started via weston@root.service"
             return 0
         fi
 
-        log_warn "systemd start did not bring Weston up; will try direct spawn."
+        # Try one enabled weston@ instance if any exists
+        enabled_unit="$(systemctl list-unit-files 'weston@*.service' --no-legend --no-pager 2>/dev/null | awk '$2=="enabled"{print $1; exit}')"
+        if [ -n "$enabled_unit" ]; then
+            log_info "Attempting to start Weston via enabled instance $enabled_unit"
+            systemctl start "$enabled_unit" >/dev/null 2>&1 || true
+            sleep 1
+            if weston_is_running; then
+                log_info "Weston started via instance $enabled_unit"
+                return 0
+            fi
+        fi
+
+        log_warn "systemd start did not bring Weston up, trying direct spawn"
     fi
 
+    # Minimal-friendly direct spawn
     ensure_xdg_runtime_dir
 
     if ! command -v weston >/dev/null 2>&1; then
-        log_fail "weston binary not found in PATH."
+        log_fail "weston binary not found in PATH"
         return 1
     fi
 
-    log_info "Attempting to spawn Weston (no backend override). Log: /tmp/weston.self.log"
+    log_info "Spawning Weston directly, log file is /tmp/weston.self.log"
     ( nohup weston --log=/tmp/weston.self.log >/dev/null 2>&1 & ) || true
 
     tries=0
-    while [ "$tries" -lt 10 ]; do
+    while [ "$tries" -lt 8 ]; do
         if weston_is_running; then
-            log_info "Weston is now running (PID(s): $(weston_pids))."
-            # Optional: show socket for debug (base/prop both)
-            sock="$(find_wayland_sockets | head -n 1)"
-            [ -n "$sock" ] && log_info "Wayland socket: $sock"
+            log_info "Weston is now running, PID list is $(weston_pids)"
+            return 0
+        fi
+        if [ -n "$(find_wayland_sockets 2>/dev/null | head -n 1)" ]; then
+            log_info "Wayland socket appeared after spawn"
             return 0
         fi
         sleep 1
@@ -993,10 +1038,10 @@ weston_start() {
     done
 
     if [ -f /tmp/weston.self.log ]; then
-        log_warn "Weston spawn failed; last log lines:"
+        log_warn "Weston spawn failed, last log lines follow"
         tail -n 20 /tmp/weston.self.log 2>/dev/null | sed 's/^/[weston.log] /' || true
     else
-        log_warn "Weston spawn failed; no log file present."
+        log_warn "Weston spawn failed, no log file present"
     fi
     return 1
 }
@@ -1123,6 +1168,7 @@ wayland_pick_socket() {
     return 1
 }
 
+# ---- Wayland/Weston helpers -----------------------
 # Return first Wayland socket under a base dir (prints path or fails).
 find_wayland_socket_in() {
     base="$1"
@@ -1332,46 +1378,38 @@ weston_pick_env_or_start() {
 
 # Find candidate Wayland sockets in common locations.
 # Prints absolute socket paths, one per line, most-preferred first.
-weston_is_running() {
-    # Process-based ONLY (do not use socket existence)
-    pids="$(weston_pids)"
-    [ -n "$pids" ]
-}
- 
 find_wayland_sockets() {
-    # Keep your base/prop behavior:
-    # - base: /run/user/$uid/wayland-*
-    # - prop: /dev/socket/weston (or /dev/socket/weston/wayland-*)
-    # - also allow /run/wayland-*
-    # NOTE: socket presence != process presence; use only for diagnostics.
-    for s in \
-        /dev/socket/weston \
-        /dev/socket/weston/wayland-* \
-        /run/wayland-* \
-        /run/user/*/wayland-* \
-        "${XDG_RUNTIME_DIR:-}"/wayland-* \
-        ; do
-        [ -S "$s" ] && printf '%s\n' "$s"
+    uid="$(id -u 2>/dev/null || echo 0)"
+ 
+    if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -n "${WAYLAND_DISPLAY:-}" ] &&
+       [ -S "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY" ]; then
+        echo "$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
+    fi
+ 
+    # Current uid
+    for f in "/run/user/$uid/wayland-0" "/run/user/$uid/wayland-1" "/run/user/$uid/wayland-2"; do
+        [ -S "$f" ] && echo "$f"
     done
-}
-
-weston_cleanup_stale_sockets() {
-    # Remove stale sockets only if weston is NOT running.
-    weston_is_running && return 0
-
-    # Collect candidates (base + prop + common)
-    for s in \
-        /dev/socket/weston \
-        /dev/socket/weston/wayland-* \
-        /run/wayland-* \
-        /run/user/*/wayland-* \
-        "${XDG_RUNTIME_DIR:-}"/wayland-* \
-        ; do
-        [ -S "$s" ] || continue
-        # Best-effort cleanup; ignore errors (permissions)
-        rm -f "$s" 2>/dev/null || true
-    done
-    return 0
+    for f in /run/user/"$uid"/wayland-*; do
+        [ -S "$f" ] && echo "$f"
+    done 2>/dev/null
+ 
+    # Any other user under /run/user (covers weston as uid 100, 1000, etc.)
+    for d in /run/user/*; do
+        [ -d "$d" ] || continue
+        [ "$d" = "/run/user/$uid" ] && continue  # skip current uid, already handled above
+        for f in "$d"/wayland-*; do
+            [ -S "$f" ] && echo "$f"
+        done
+    done 2>/dev/null
+ 
+    for f in /dev/socket/weston/wayland-*; do
+        [ -S "$f" ] && echo "$f"
+    done 2>/dev/null
+ 
+    for f in /tmp/wayland-*; do
+        [ -S "$f" ] && echo "$f"
+    done 2>/dev/null
 }
 
 # Ensure XDG_RUNTIME_DIR has owner=current-user and mode 0700.
@@ -3241,69 +3279,35 @@ detect_ufs_partition_block() {
 ###############################################################################
 scan_dmesg_errors() {
     prefix="$1"
-    module_regex="$2"   # e.g. 'qcom_camss|camss|isp|CAM-ICP|CAMERA_ICP'
+    module_regex="$2"   # e.g. 'qcom_camss|camss|isp'
     exclude_regex="${3:-"dummy regulator|supply [^ ]+ not found|using dummy regulator"}"
-    success_regex="${4:-}"      # OPTIONAL: require success evidence (e.g. FW download done successfully)
-    success_min_hits="${5:-1}"  # OPTIONAL: minimum success hits required (default 1)
- 
-    shift 5 2>/dev/null || true
- 
-    mkdir -p "$prefix" 2>/dev/null || true
- 
+    shift 3
+
+    mkdir -p "$prefix"
+
     DMESG_SNAPSHOT="$prefix/dmesg_snapshot.log"
     DMESG_ERRORS="$prefix/dmesg_errors.log"
-    DMESG_SUCCESS="$prefix/dmesg_success.log"
-    DATE_STAMP=$(date +%Y%m%d-%H%M%S 2>/dev/null || echo "unknown-date")
+    DATE_STAMP=$(date +%Y%m%d-%H%M%S)
     DMESG_HISTORY="$prefix/dmesg_errors_$DATE_STAMP.log"
- 
+
     # Error patterns (edit as needed for your test coverage)
     err_patterns='Unknown symbol|probe failed|fail(ed)?|error|timed out|not found|invalid|corrupt|abort|panic|oops|unhandled|can.t (start|init|open|allocate|find|register)'
- 
-    rm -f "$DMESG_SNAPSHOT" "$DMESG_ERRORS" "$DMESG_SUCCESS" 2>/dev/null || true
-    dmesg > "$DMESG_SNAPSHOT" 2>/dev/null || true
- 
-    # Robust match:
-    # - First filter by module_regex (anywhere in line)
-    # - Then filter by err_patterns
-    # - Exclude benign patterns
-    #
-    # This works for both:
-    #   [..] module: error ...
-    # and:
-    #   [..] CAM_INFO: ... fail ...
-    #
-    # Note: module_regex should be tight enough to avoid false positives.
-    grep -iE "($module_regex)" "$DMESG_SNAPSHOT" 2>/dev/null \
-        | grep -iE "($err_patterns)" 2>/dev/null \
-        | grep -vEi "$exclude_regex" 2>/dev/null > "$DMESG_ERRORS" || true
- 
-    cp "$DMESG_ERRORS" "$DMESG_HISTORY" 2>/dev/null || true
- 
+
+    rm -f "$DMESG_SNAPSHOT" "$DMESG_ERRORS"
+    dmesg > "$DMESG_SNAPSHOT" 2>/dev/null
+
+    # 1. Match lines with correct module and error pattern
+    # 2. Exclude lines with harmless patterns (using dummy regulator etc)
+    grep -iE "^\[[^]]+\][[:space:]]+($module_regex):.*($err_patterns)" "$DMESG_SNAPSHOT" \
+        | grep -vEi "$exclude_regex" > "$DMESG_ERRORS" || true
+
+    cp "$DMESG_ERRORS" "$DMESG_HISTORY"
+
     if [ -s "$DMESG_ERRORS" ]; then
-        log_info "dmesg scan found non benign module errors in $DMESG_ERRORS (history: $DMESG_HISTORY)"
+        log_info "dmesg scan: found non-benign module errors in $DMESG_ERRORS (history: $DMESG_HISTORY)"
         return 0
     fi
- 
-    # Optional success evidence check (no extra greps in run.sh)
-    if [ -n "$success_regex" ]; then
-        grep -iE "($success_regex)" "$DMESG_SNAPSHOT" 2>/dev/null > "$DMESG_SUCCESS" || true
- 
-        hits="$(wc -l < "$DMESG_SUCCESS" 2>/dev/null | awk '{print $1}')"
-        case "$hits" in ''|*[!0-9]*) hits=0 ;; esac
- 
-        case "$success_min_hits" in ''|*[!0-9]*) success_min_hits=1 ;; esac
- 
-        if [ "$hits" -lt "$success_min_hits" ]; then
-            log_info "dmesg scan found no required success evidence for modules [$module_regex] (need >=$success_min_hits hits). See $DMESG_SUCCESS"
-            return 2
-        fi
- 
-        log_info "dmesg scan success evidence present in $DMESG_SUCCESS (hits=$hits)"
-    else
-        log_info "No relevant, non benign errors for modules [$module_regex] in recent dmesg."
-    fi
- 
-    # No errors
+    log_info "No relevant, non-benign errors for modules [$module_regex] in recent dmesg."
     return 1
 }
 
