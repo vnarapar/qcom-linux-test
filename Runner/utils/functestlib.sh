@@ -3310,6 +3310,9 @@ scan_dmesg_errors() {
 
     if [ -s "$DMESG_ERRORS" ]; then
         log_info "dmesg scan: found non-benign module errors in $DMESG_ERRORS (history: $DMESG_HISTORY)"
+        while IFS= read -r line; do
+            log_info "[dmesg] $line"
+        done < "$DMESG_ERRORS"
         return 0
     fi
     log_info "No relevant, non-benign errors for modules [$module_regex] in recent dmesg."
