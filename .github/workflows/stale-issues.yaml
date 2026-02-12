@@ -13,8 +13,8 @@ jobs:
     steps:
     - uses: actions/stale@v10
       with:
-        stale-issue-message: 'This issue has been marked as stale due to 30 days of inactivity.'
-        stale-pr-message: 'This pull request has been marked as stale due to 30 days of inactivity.'
+        stale-issue-message: '@qualcomm/qualcomm-linux-testing.triage This issue has been marked as stale due to 30 days of inactivity.'
+        stale-pr-message: '@ualcomm/qualcomm-linux-testing.triage This pull request has been marked as stale due to 30 days of inactivity.'
 
         days-before-stale: 30
         days-before-close: -1
