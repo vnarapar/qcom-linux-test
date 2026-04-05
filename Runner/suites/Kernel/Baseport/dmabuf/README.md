@@ -63,10 +63,8 @@ Generates:
 [PASS] 2026-03-23 12:39:06 -   CONFIG_TEE_DMABUF_HEAPS: enabled
 [PASS] 2026-03-23 12:39:06 - Kernel config CONFIG_HAS_DMA is enabled
 [PASS] 2026-03-23 12:39:06 -   CONFIG_HAS_DMA: enabled
-[WARN] 2026-03-23 12:39:06 - Kernel config CONFIG_DMA_HEAP is missing or not enabled
-[WARN] 2026-03-23 12:39:06 -   CONFIG_DMA_HEAP: not enabled (optional)
-[WARN] 2026-03-23 12:39:06 - Kernel config CONFIG_DMA_CMA is missing or not enabled
-[WARN] 2026-03-23 12:39:06 -   CONFIG_DMA_CMA: not enabled (optional)
+[WARN] 2026-03-23 12:39:06 - Optional Kernel config CONFIG_DMA_HEAP is missing or not enabled
+[WARN] 2026-03-23 12:39:06 - Optional Kernel config CONFIG_DMA_CMA is missing or not enabled
 [INFO] 2026-03-23 12:39:06 - === Device Tree Validation ===
 [INFO] 2026-03-23 12:39:06 - Found reserved-memory node
 [INFO] 2026-03-23 12:39:06 -   Region: adsp-region@95c00000

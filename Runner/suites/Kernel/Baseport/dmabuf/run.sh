@@ -20,7 +20,7 @@ if [ -z "$INIT_ENV" ]; then
 fi
 
 # Only source if not already loaded (idempotent)
-if [ -z "${__INIT_ENV_LOADED:-}" ]; then
+if [ "${__INIT_ENV_LOADED:-}" ]; then
     # shellcheck disable=SC1090
     . "$INIT_ENV"
 fi
@@ -37,25 +37,25 @@ log_info "======================================================================
 log_info "============ Starting $TESTNAME Testcase ======================================="
 log_info "================================================================================"
 
-if ! check_dependencies "find grep basename"; then
+if ! check_dependencies "find grep basename awk"; then
     log_skip "$TESTNAME : Dependency check failed. Skipping."
     echo "$TESTNAME SKIP" > "$res_file"
     exit 0
 fi
 
-pass=true
+pass="true"
 
 log_info "=== Kernel Configuration Validation ==="
 
 if [ ! -f /proc/config.gz ]; then
-    log_warn "/proc/config.gz not found — kernel config checks will be skipped"
+    log_warn "/proc/config.gz not found  -  kernel config checks will be skipped"
     log_warn "Ensure CONFIG_IKCONFIG and CONFIG_IKCONFIG_PROC are enabled in the kernel"
 else
     CORE_CONFIGS="CONFIG_DMA_SHARED_BUFFER CONFIG_DMABUF_HEAPS CONFIG_DMABUF_HEAPS_SYSTEM"
 
     if ! check_kernel_config "$CORE_CONFIGS"; then
         log_fail "Core DMA-BUF kernel config validation failed"
-        pass=false
+        pass="false"
     else
         log_pass "Core DMA-BUF configs available"
     fi
@@ -64,10 +64,10 @@ else
 
     log_info "Checking optional DMA-BUF configurations..."
     for cfg in $OPTIONAL_CONFIGS; do
-        if check_optional_config "$cfg" 2>/dev/null; then
-            log_pass "  $cfg: enabled"
+        if zgrep -qE "^${cfg}=(y|m)" /proc/config.gz 2>/dev/null; then
+            log_pass "  Optional config $cfg is enabled"
         else
-            log_warn "  $cfg: not enabled (optional)"
+            log_info "  Optional config $cfg is not enabled (optional)"
         fi
     done
 fi
@@ -89,18 +89,17 @@ fi
 
 if check_dt_nodes "/proc/device-tree/soc*/dma* /proc/device-tree/soc*/qcom,ion* /proc/device-tree/ion*"; then
     log_pass "At least one node was found."
-	found_nodes=$((found_nodes + 1))
+    found_nodes=$((found_nodes + 1))
 else
     log_fail "None of the requested nodes were found."
-	echo "$TESTNAME FAIL" > "$res_file"
-    exit 1
+    pass="false"
 fi
 
 if [ "$found_nodes" -gt 0 ]; then
     log_pass "Device tree validation passed (found $found_nodes relevant nodes)"
 else
     log_fail "No DMA-BUF specific device-tree nodes found"
-	pass=false
+    pass="false"
 fi
 
 # Check for DMA heap devices
@@ -118,7 +117,7 @@ if [ -d "/dev/dma_heap" ]; then
     log_pass "Total heaps found: $heap_count"
 else
     log_fail "DMA heap device directory not found"
-	pass=false
+    pass="false"
 fi
 
 if [ -f "/sys/kernel/debug/dma_buf/bufinfo" ]; then
@@ -138,7 +137,7 @@ else
     log_warn "DMA-BUF bufinfo not available (debugfs may not be mounted)"
 fi
 
-if $pass; then
+if [ "$pass" = "true" ]; then
     log_pass "$TESTNAME : Test Passed"
     echo "$TESTNAME PASS" > "$res_file"
 else

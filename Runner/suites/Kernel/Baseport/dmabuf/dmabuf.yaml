@@ -19,5 +19,5 @@ run:
     steps:
         - REPO_PATH=$PWD
         - cd "$REPO_PATH/Runner/suites/Kernel/Baseport/dmabuf"  || true
-        - ./run.sh  || true
-        - $REPO_PATH/Runner/utils/send-to-lava.sh dmabuf.res || true
+        - ./run.sh
+        - $REPO_PATH/Runner/utils/send-to-lava.sh dmabuf.res

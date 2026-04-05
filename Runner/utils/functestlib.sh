@@ -256,17 +256,17 @@ check_optional_config() {
     for config_key in $cfgs; do
         if command -v zgrep >/dev/null 2>&1; then
             if zgrep -qE "^${config_key}=(y|m)" /proc/config.gz 2>/dev/null; then
-                log_pass "Kernel config $config_key is enabled"
+                log_pass "Optional Kernel config $config_key is enabled"
             else
-                log_warn "Kernel config $config_key is missing or not enabled"
+                log_warn "Optional Kernel config $config_key is missing or not enabled"
                 return 1
             fi
         else
             # Fallback if zgrep is unavailable
             if gzip -dc /proc/config.gz 2>/dev/null | grep -qE "^${config_key}=(y|m)"; then
-                log_pass "Kernel config $config_key is enabled"
+                log_pass "Optional Kernel config $config_key is enabled"
             else
-                log_warn "Kernel config $config_key is missing or not enabled"
+                log_warn "Optional Kernel config $config_key is missing or not enabled"
                 return 1
             fi
         fi
