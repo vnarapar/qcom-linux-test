@@ -784,15 +784,15 @@ if [ "$USE_CONFIG_DISCOVERY" = "true" ]; then
 
       log_info "[$case_name] loop $i/$LOOPS start=$iso rate=${rate}Hz channels=$channels backend=$AUDIO_BACKEND $loop_hdr"
 
-      out="$LOGDIR/${case_name}.wav"
-      : > "$out"
+      record_out="$LOGDIR/${case_name}.wav"
+      : > "$record_out"
       start_s="$(date +%s 2>/dev/null || echo 0)"
 
       if [ "$AUDIO_BACKEND" = "pipewire" ]; then
-        log_info "[$case_name] exec: pw-record -v --rate=$rate --channels=$channels \"$out\""
-        audio_exec_with_timeout "$effective_timeout" pw-record -v --rate="$rate" --channels="$channels" "$out" >> "$logf" 2>&1
+        log_info "[$case_name] exec: pw-record -v --rate=$rate --channels=$channels \"$record_out\""
+        audio_exec_with_timeout "$effective_timeout" pw-record -v --rate="$rate" --channels="$channels" "$record_out" >> "$logf" 2>&1
         rc=$?
-        bytes="$(file_size_bytes "$out" 2>/dev/null || echo 0)"
+        bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
 
         # If pw-record failed AND PipeWire control-plane is broken, restart/bootstrap and retry once
         if [ "$rc" -ne 0 ] && ! audio_pw_ctl_ok 2>/dev/null; then
@@ -807,12 +807,12 @@ if [ "$USE_CONFIG_DISCOVERY" = "true" ]; then
             export AUDIO_SYSTEMD_MANAGED
           fi
 
-          out="$LOGDIR/${case_name}.wav"
-          : > "$out"
-          log_info "[$case_name] retry: pw-record -v --rate=$rate --channels=$channels \"$out\""
-          audio_exec_with_timeout "$effective_timeout" pw-record -v --rate="$rate" --channels="$channels" "$out" >> "$logf" 2>&1
+          record_out="$LOGDIR/${case_name}.wav"
+          : > "$record_out"
+          log_info "[$case_name] retry: pw-record -v --rate=$rate --channels=$channels \"$record_out\""
+          audio_exec_with_timeout "$effective_timeout" pw-record -v --rate="$rate" --channels="$channels" "$record_out" >> "$logf" 2>&1
           rc=$?
-          bytes="$(file_size_bytes "$out" 2>/dev/null || echo 0)"
+          bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
         fi
 
         # If we already got real audio, accept and skip fallbacks
@@ -828,12 +828,12 @@ if [ "$USE_CONFIG_DISCOVERY" = "true" ]; then
             if [ -n "$pcm" ]; then
               secs_int="$(audio_parse_secs "$secs" 2>/dev/null || echo 0)"
               [ -z "$secs_int" ] && secs_int=0
-              : > "$out"
-              log_info "[$case_name] fallback: arecord -D $pcm -f S16_LE -r $rate -c $channels -d $secs_int \"$out\""
+              : > "$record_out"
+              log_info "[$case_name] fallback: arecord -D $pcm -f S16_LE -r $rate -c $channels -d $secs_int \"$record_out\""
               audio_exec_with_timeout "$effective_timeout" \
-                arecord -D "$pcm" -f S16_LE -r "$rate" -c "$channels" -d "$secs_int" "$out" >> "$logf" 2>&1
+                arecord -D "$pcm" -f S16_LE -r "$rate" -c "$channels" -d "$secs_int" "$record_out" >> "$logf" 2>&1
               rc=$?
-              bytes="$(file_size_bytes "$out" 2>/dev/null || echo 0)"
+              bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
             fi
           fi
 
@@ -847,11 +847,11 @@ if [ "$USE_CONFIG_DISCOVERY" = "true" ]; then
             fi
           fi
           if [ "$retry_target" -eq 1 ] && [ -n "$SRC_ID" ]; then
-            : > "$out"
-            log_info "[$case_name] exec: pw-record -v --rate=$rate --channels=$channels --target \"$SRC_ID\" \"$out\""
-            audio_exec_with_timeout "$effective_timeout" pw-record -v --rate="$rate" --channels="$channels" --target "$SRC_ID" "$out" >> "$logf" 2>&1
+            : > "$record_out"
+            log_info "[$case_name] exec: pw-record -v --rate=$rate --channels=$channels --target \"$SRC_ID\" \"$record_out\""
+            audio_exec_with_timeout "$effective_timeout" pw-record -v --rate="$rate" --channels="$channels" --target "$SRC_ID" "$record_out" >> "$logf" 2>&1
             rc=$?
-            bytes="$(file_size_bytes "$out" 2>/dev/null || echo 0)"
+            bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
           fi
         fi
 
@@ -865,11 +865,11 @@ if [ "$USE_CONFIG_DISCOVERY" = "true" ]; then
         if [ "$AUDIO_BACKEND" = "alsa" ]; then
           secs_int="$(audio_parse_secs "$secs" 2>/dev/null || echo 0)"
           [ -z "$secs_int" ] && secs_int=0
-          log_info "[$case_name] exec: arecord -D \"$SRC_ID\" -f S16_LE -r $rate -c $channels -d $secs_int \"$out\""
+          log_info "[$case_name] exec: arecord -D \"$SRC_ID\" -f S16_LE -r $rate -c $channels -d $secs_int \"$record_out\""
           audio_exec_with_timeout "$effective_timeout" \
-            arecord -D "$SRC_ID" -f S16_LE -r "$rate" -c "$channels" -d "$secs_int" "$out" >> "$logf" 2>&1
+            arecord -D "$SRC_ID" -f S16_LE -r "$rate" -c "$channels" -d "$secs_int" "$record_out" >> "$logf" 2>&1
           rc=$?
-          bytes="$(file_size_bytes "$out" 2>/dev/null || echo 0)"
+          bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
 
           retry_alsa=0
           if [ "$rc" -ne 0 ]; then
@@ -887,12 +887,12 @@ if [ "$USE_CONFIG_DISCOVERY" = "true" ]; then
               alt_dev="$SRC_ID"
             fi
 
-            : > "$out"
-            log_info "[$case_name] retry: arecord -D \"$alt_dev\" -f S16_LE -r $rate -c $channels -d $secs_int \"$out\""
+            : > "$record_out"
+            log_info "[$case_name] retry: arecord -D \"$alt_dev\" -f S16_LE -r $rate -c $channels -d $secs_int \"$record_out\""
             audio_exec_with_timeout "$effective_timeout" \
-              arecord -D "$alt_dev" -f S16_LE -r "$rate" -c "$channels" -d "$secs_int" "$out" >> "$logf" 2>&1
+              arecord -D "$alt_dev" -f S16_LE -r "$rate" -c "$channels" -d "$secs_int" "$record_out" >> "$logf" 2>&1
             rc=$?
-            bytes="$(file_size_bytes "$out" 2>/dev/null || echo 0)"
+            bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
 
             retry_fallback=0
             if [ "$rc" -ne 0 ]; then
@@ -915,12 +915,12 @@ if [ "$USE_CONFIG_DISCOVERY" = "true" ]; then
                 fallback_ch="$(printf '%s\n' "$combo" | awk '{print $3}')"
                 [ -z "$fmt" ] || [ -z "$fallback_rate" ] || [ -z "$fallback_ch" ] && continue
 
-                : > "$out"
-                log_info "[$case_name] fallback: arecord -D \"$alt_dev\" -f $fmt -r $fallback_rate -c $fallback_ch -d $secs_int \"$out\""
+                : > "$record_out"
+                log_info "[$case_name] fallback: arecord -D \"$alt_dev\" -f $fmt -r $fallback_rate -c $fallback_ch -d $secs_int \"$record_out\""
                 audio_exec_with_timeout "$effective_timeout" \
-                  arecord -D "$alt_dev" -f "$fmt" -r "$fallback_rate" -c "$fallback_ch" -d "$secs_int" "$out" >> "$logf" 2>&1
+                  arecord -D "$alt_dev" -f "$fmt" -r "$fallback_rate" -c "$fallback_ch" -d "$secs_int" "$record_out" >> "$logf" 2>&1
                 rc=$?
-                bytes="$(file_size_bytes "$out" 2>/dev/null || echo 0)"
+                bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
                 if [ "$rc" -eq 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
                   break
                 fi
@@ -935,10 +935,10 @@ if [ "$USE_CONFIG_DISCOVERY" = "true" ]; then
 
         else
           # PulseAudio
-          log_info "[$case_name] exec: parecord --rate=$rate --channels=$channels --file-format=wav \"$out\""
-          audio_exec_with_timeout "$effective_timeout" parecord --rate="$rate" --channels="$channels" --file-format=wav "$out" >> "$logf" 2>&1
+          log_info "[$case_name] exec: parecord --rate=$rate --channels=$channels --file-format=wav \"$record_out\""
+          audio_exec_with_timeout "$effective_timeout" parecord --rate="$rate" --channels="$channels" --file-format=wav "$record_out" >> "$logf" 2>&1
           rc=$?
-          bytes="$(file_size_bytes "$out" 2>/dev/null || echo 0)"
+          bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
 
           # If parecord failed AND PulseAudio control-plane is broken, restart/bootstrap and retry once
           if [ "$rc" -ne 0 ] && ! audio_pa_ctl_ok 2>/dev/null; then
@@ -951,14 +951,14 @@ if [ "$USE_CONFIG_DISCOVERY" = "true" ]; then
               audio_bootstrap_backend_if_needed >/dev/null 2>&1 || true
               AUDIO_SYSTEMD_MANAGED=0
               export AUDIO_SYSTEMD_MANAGED
-            fi
+	   fi
 
-            out="$LOGDIR/${case_name}.wav"
-            : > "$out"
-            log_info "[$case_name] retry: parecord --rate=$rate --channels=$channels --file-format=wav \"$out\""
-            audio_exec_with_timeout "$effective_timeout" parecord --rate="$rate" --channels="$channels" --file-format=wav "$out" >> "$logf" 2>&1
+            record_out="$LOGDIR/${case_name}.wav"
+            : > "$record_out"
+            log_info "[$case_name] retry: parecord --rate=$rate --channels=$channels --file-format=wav \"$record_out\""
+            audio_exec_with_timeout "$effective_timeout" parecord --rate="$rate" --channels="$channels" --file-format=wav "$record_out" >> "$logf" 2>&1
             rc=$?
-            bytes="$(file_size_bytes "$out" 2>/dev/null || echo 0)"
+            bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
           fi
 
           if [ "$rc" -ne 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
@@ -1004,7 +1004,7 @@ if [ "$USE_CONFIG_DISCOVERY" = "true" ]; then
 
       if [ "$rc" -eq 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
         log_pass "[$case_name] loop $i OK (rc=0, ${last_elapsed}s, bytes=$bytes)"
-	ok_runs=$((ok_runs + 1))
+        ok_runs=$((ok_runs + 1))
       else
         log_fail "[$case_name] loop $i FAILED (rc=$rc, ${last_elapsed}s, bytes=${bytes:-0}) - see $logf"
       fi
@@ -1022,15 +1022,15 @@ if [ "$USE_CONFIG_DISCOVERY" = "true" ]; then
 
     case "$status" in
       PASS)
-	pass=$((pass + 1))
+        pass=$((pass + 1))
         echo "$case_name PASS" >> "$LOGDIR/summary.txt"
         ;;
       SKIP)
-	skip=$((skip + 1))
+        skip=$((skip + 1))
         echo "$case_name SKIP" >> "$LOGDIR/summary.txt"
         ;;
       FAIL)
-	fail=$((fail + 1))
+        fail=$((fail + 1))
         echo "$case_name FAIL" >> "$LOGDIR/summary.txt"
         suite_rc=1
         ;;
@@ -1081,15 +1081,15 @@ else
 
       log_info "[$case_name] loop $i/$LOOPS start=$iso secs=$secs backend=$AUDIO_BACKEND $loop_hdr"
 
-      out="$LOGDIR/${case_name}.wav"
-      : > "$out"
+      record_out="$LOGDIR/${case_name}.wav"
+      : > "$record_out"
       start_s="$(date +%s 2>/dev/null || echo 0)"
 
       if [ "$AUDIO_BACKEND" = "pipewire" ]; then
-        log_info "[$case_name] exec: pw-record -v \"$out\""
-        audio_exec_with_timeout "$effective_timeout" pw-record -v "$out" >> "$logf" 2>&1
+        log_info "[$case_name] exec: pw-record -v \"$record_out\""
+        audio_exec_with_timeout "$effective_timeout" pw-record -v "$record_out" >> "$logf" 2>&1
         rc=$?
-        bytes="$(file_size_bytes "$out" 2>/dev/null || echo 0)"
+        bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
 
         # If pw-record failed AND PipeWire control-plane is broken, restart/bootstrap and retry once
         if [ "$rc" -ne 0 ] && ! audio_pw_ctl_ok 2>/dev/null; then
@@ -1104,12 +1104,12 @@ else
             export AUDIO_SYSTEMD_MANAGED
           fi
 
-          out="$LOGDIR/${case_name}.wav"
-          : > "$out"
-          log_info "[$case_name] retry: pw-record -v \"$out\""
-          audio_exec_with_timeout "$effective_timeout" pw-record -v "$out" >> "$logf" 2>&1
+          record_out="$LOGDIR/${case_name}.wav"
+          : > "$record_out"
+          log_info "[$case_name] retry: pw-record -v \"$record_out\""
+          audio_exec_with_timeout "$effective_timeout" pw-record -v "$record_out" >> "$logf" 2>&1
           rc=$?
-          bytes="$(file_size_bytes "$out" 2>/dev/null || echo 0)"
+          bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
         fi
 
         # If we already got real audio, accept and skip fallbacks
@@ -1118,19 +1118,19 @@ else
             log_warn "[$case_name] nonzero rc=$rc but recording looks valid (bytes=$bytes) - PASS"
             rc=0
           fi
-        else
+         else
           # Only if output is tiny/empty do we try a virtual PCM
           if command -v arecord >/dev/null 2>&1; then
             pcm="$(alsa_pick_virtual_pcm || true)"
             if [ -n "$pcm" ]; then
               secs_int="$(audio_parse_secs "$secs" 2>/dev/null || echo 0)"
               [ -z "$secs_int" ] && secs_int=0
-              : > "$out"
-              log_info "[$case_name] fallback: arecord -D $pcm -f S16_LE -r 48000 -c 2 -d $secs_int \"$out\""
+              : > "$record_out"
+              log_info "[$case_name] fallback: arecord -D $pcm -f S16_LE -r 48000 -c 2 -d $secs_int \"$record_out\""
               audio_exec_with_timeout "$effective_timeout" \
-                arecord -D "$pcm" -f S16_LE -r 48000 -c 2 -d "$secs_int" "$out" >> "$logf" 2>&1
+                arecord -D "$pcm" -f S16_LE -r 48000 -c 2 -d "$secs_int" "$record_out" >> "$logf" 2>&1
               rc=$?
-              bytes="$(file_size_bytes "$out" 2>/dev/null || echo 0)"
+              bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
             fi
           fi
 
@@ -1144,11 +1144,11 @@ else
             fi
           fi
           if [ "$retry_target" -eq 1 ] && [ -n "$SRC_ID" ]; then
-            : > "$out"
-            log_info "[$case_name] exec: pw-record -v --target \"$SRC_ID\" \"$out\""
-            audio_exec_with_timeout "$effective_timeout" pw-record -v --target "$SRC_ID" "$out" >> "$logf" 2>&1
+            : > "$record_out"
+            log_info "[$case_name] exec: pw-record -v --target \"$SRC_ID\" \"$record_out\""
+            audio_exec_with_timeout "$effective_timeout" pw-record -v --target "$SRC_ID" "$record_out" >> "$logf" 2>&1
             rc=$?
-            bytes="$(file_size_bytes "$out" 2>/dev/null || echo 0)"
+            bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
           fi
         fi
 
@@ -1162,11 +1162,11 @@ else
         if [ "$AUDIO_BACKEND" = "alsa" ]; then
           secs_int="$(audio_parse_secs "$secs" 2>/dev/null || echo 0)"
           [ -z "$secs_int" ] && secs_int=0
-          log_info "[$case_name] exec: arecord -D \"$SRC_ID\" -f S16_LE -r 48000 -c 2 -d $secs_int \"$out\""
+          log_info "[$case_name] exec: arecord -D \"$SRC_ID\" -f S16_LE -r 48000 -c 2 -d $secs_int \"$record_out\""
           audio_exec_with_timeout "$effective_timeout" \
-            arecord -D "$SRC_ID" -f S16_LE -r 48000 -c 2 -d "$secs_int" "$out" >> "$logf" 2>&1
+            arecord -D "$SRC_ID" -f S16_LE -r 48000 -c 2 -d "$secs_int" "$record_out" >> "$logf" 2>&1
           rc=$?
-          bytes="$(file_size_bytes "$out" 2>/dev/null || echo 0)"
+          bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
 
           retry_alsa=0
           if [ "$rc" -ne 0 ]; then
@@ -1195,12 +1195,12 @@ else
               ch="$(printf '%s\n' "$combo" | awk '{print $3}')"
               [ -z "$fmt" ] || [ -z "$rate" ] || [ -z "$ch" ] && continue
 
-              : > "$out"
-              log_info "[$case_name] retry: arecord -D \"$alt_dev\" -f $fmt -r $rate -c $ch -d $secs_int \"$out\""
+              : > "$record_out"
+              log_info "[$case_name] retry: arecord -D \"$alt_dev\" -f $fmt -r $rate -c $ch -d $secs_int \"$record_out\""
               audio_exec_with_timeout "$effective_timeout" \
-                arecord -D "$alt_dev" -f "$fmt" -r "$rate" -c "$ch" -d "$secs_int" "$out" >> "$logf" 2>&1
+                arecord -D "$alt_dev" -f "$fmt" -r "$rate" -c "$ch" -d "$secs_int" "$record_out" >> "$logf" 2>&1
               rc=$?
-              bytes="$(file_size_bytes "$out" 2>/dev/null || echo 0)"
+              bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
               if [ "$rc" -eq 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
                 break
               fi
@@ -1214,10 +1214,10 @@ else
 
         else
           # PulseAudio
-          log_info "[$case_name] exec: parecord --file-format=wav \"$out\""
-          audio_exec_with_timeout "$effective_timeout" parecord --file-format=wav "$out" >> "$logf" 2>&1
+          log_info "[$case_name] exec: parecord --file-format=wav \"$record_out\""
+          audio_exec_with_timeout "$effective_timeout" parecord --file-format=wav "$record_out" >> "$logf" 2>&1
           rc=$?
-          bytes="$(file_size_bytes "$out" 2>/dev/null || echo 0)"
+          bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
 
           # If parecord failed AND PulseAudio control-plane is broken, restart/bootstrap and retry once
           if [ "$rc" -ne 0 ] && ! audio_pa_ctl_ok 2>/dev/null; then
@@ -1232,12 +1232,12 @@ else
               export AUDIO_SYSTEMD_MANAGED
             fi
 
-            out="$LOGDIR/${case_name}.wav"
-            : > "$out"
-            log_info "[$case_name] retry: parecord --file-format=wav \"$out\""
-            audio_exec_with_timeout "$effective_timeout" parecord --file-format=wav "$out" >> "$logf" 2>&1
+            record_out="$LOGDIR/${case_name}.wav"
+            : > "$record_out"
+            log_info "[$case_name] retry: parecord --file-format=wav \"$record_out\""
+            audio_exec_with_timeout "$effective_timeout" parecord --file-format=wav "$record_out" >> "$logf" 2>&1
             rc=$?
-            bytes="$(file_size_bytes "$out" 2>/dev/null || echo 0)"
+            bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
           fi
 
           if [ "$rc" -ne 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
@@ -1283,7 +1283,7 @@ else
 
       if [ "$rc" -eq 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
         log_pass "[$case_name] loop $i OK (rc=0, ${last_elapsed}s, bytes=$bytes)"
-	ok_runs=$((ok_runs + 1))
+        ok_runs=$((ok_runs + 1))
       else
         log_fail "[$case_name] loop $i FAILED (rc=$rc, ${last_elapsed}s, bytes=${bytes:-0}) - see $logf"
       fi
@@ -1301,15 +1301,15 @@ else
 
     case "$status" in
       PASS)
-	pass=$((pass + 1))
+        pass=$((pass + 1))
         echo "$case_name PASS" >> "$LOGDIR/summary.txt"
         ;;
       SKIP)
-	skip=$((skip + 1))
+        skip=$((skip + 1))
         echo "$case_name SKIP" >> "$LOGDIR/summary.txt"
         ;;
       FAIL)
-	fail=$((fail + 1))
+        fail=$((fail + 1))
         echo "$case_name FAIL" >> "$LOGDIR/summary.txt"
         suite_rc=1
         ;;

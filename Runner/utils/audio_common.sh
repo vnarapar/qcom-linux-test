@@ -290,7 +290,7 @@ scan_audio_dmesg() {
 }
 
 dump_mixers() {
-  out="$1"
+  audio_dump_out="$1"
   {
     echo "---- wpctl status ----"
     if command -v wpctl >/dev/null 2>&1; then
@@ -305,7 +305,7 @@ dump_mixers() {
     else
       echo "(pactl not found)"
     fi
-  } >"$out" 2>/dev/null
+  } >"$audio_dump_out" 2>/dev/null
 }
 # Returns child exit code (124 when killed by timeout). If tmo<=0, runs the
 # command directly (no watchdog).
@@ -595,22 +595,29 @@ pw_default_null() {
 }
 
 pw_sink_name_safe() {
-  id="$1"; [ -n "$id" ] || { echo ""; return 1; }
- 
-  ins="$(pwctl_inspect_safe "$id" 2>/dev/null || true)"
-  name="$(printf '%s\n' "$ins" | grep -m1 'node.description' | cut -d'"' -f2)"
-  [ -n "$name" ] || name="$(printf '%s\n' "$ins" | grep -m1 'node.name' | cut -d'"' -f2)"
- 
-  if [ -z "$name" ]; then
-    st="$(pwctl_status_safe 2>/dev/null || true)"
-    name="$(printf '%s\n' "$st" \
+  id="$1"
+  if [ -z "$id" ]; then
+    echo ""
+    return 1
+  fi
+
+  pw_inspect_text="$(pwctl_inspect_safe "$id" 2>/dev/null || true)"
+  pw_sink_label="$(printf '%s\n' "$pw_inspect_text" | grep -m1 'node.description' | cut -d'"' -f2)"
+  if [ -z "$pw_sink_label" ]; then
+    pw_sink_label="$(printf '%s\n' "$pw_inspect_text" | grep -m1 'node.name' | cut -d'"' -f2)"
+  fi
+
+  if [ -z "$pw_sink_label" ]; then
+    pw_status_text="$(pwctl_status_safe 2>/dev/null || true)"
+    pw_sink_label="$(printf '%s\n' "$pw_status_text" \
       | sed -n '/Sinks:/,/Sources:/p' \
       | grep -E "^[^0-9]*${id}[.][[:space:]]" \
       | sed 's/^[^0-9]*[0-9][0-9]*[.][[:space:]][[:space:]]*//' \
       | sed 's/[[:space:]]*\[vol:.*$//' \
-      | head -n1)"
+      | head -n 1)"
   fi
-  printf '%s\n' "$name"
+
+  printf '%s\n' "$pw_sink_label"
 }
 
 pw_sink_name() { pw_sink_name_safe "$@"; } # back-compat alias
@@ -638,22 +645,29 @@ pw_default_null_source() {
 }
 
 pw_source_label_safe() {
-  id="$1"; [ -n "$id" ] || { echo ""; return 1; }
- 
-  ins="$(pwctl_inspect_safe "$id" 2>/dev/null || true)"
-  label="$(printf '%s\n' "$ins" | grep -m1 'node.description' | cut -d'"' -f2)"
-  [ -n "$label" ] || label="$(printf '%s\n' "$ins" | grep -m1 'node.name' | cut -d'"' -f2)"
- 
-  if [ -z "$label" ]; then
-    st="$(pwctl_status_safe 2>/dev/null || true)"
-    label="$(printf '%s\n' "$st" \
+  id="$1"
+  if [ -z "$id" ]; then
+    echo ""
+    return 1
+  fi
+
+  pw_inspect_text="$(pwctl_inspect_safe "$id" 2>/dev/null || true)"
+  pw_source_label="$(printf '%s\n' "$pw_inspect_text" | grep -m1 'node.description' | cut -d'"' -f2)"
+  if [ -z "$pw_source_label" ]; then
+    pw_source_label="$(printf '%s\n' "$pw_inspect_text" | grep -m1 'node.name' | cut -d'"' -f2)"
+  fi
+
+  if [ -z "$pw_source_label" ]; then
+    pw_status_text="$(pwctl_status_safe 2>/dev/null || true)"
+    pw_source_label="$(printf '%s\n' "$pw_status_text" \
       | sed -n '/Sources:/,/Filters:/p' \
       | grep -E "^[^0-9]*${id}[.][[:space:]]" \
       | sed 's/^[^0-9]*[0-9][0-9]*[.][[:space:]][[:space:]]*//' \
       | sed 's/[[:space:]]*\[vol:.*$//' \
-      | head -n1)"
+      | head -n 1)"
   fi
-  printf '%s\n' "$label"
+
+  printf '%s\n' "$pw_source_label"
 }
 # ---------- PulseAudio: sinks (playback) ----------
 pa_default_speakers() {
