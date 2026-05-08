@@ -10,11 +10,13 @@ metadata:
 params:
   ALLOW_DEGRADED: "0"
   SCAN_DMESG: "1"
+  STRICT_MOUNT_MATRIX: "0"
   MOUNT_MATRIX: "/:ext4,erofs,squashfs:0:0;/efi:autofs,vfat:0:1;/var/lib/tee:ext4:1:0"
 
 run:
   steps:
     - REPO_PATH=$PWD
     - cd Runner/suites/Kernel/Baseport/Storage/Partition_PostBoot_Validation/ || true
-    - ALLOW_DEGRADED="${ALLOW_DEGRADED}" SCAN_DMESG="${SCAN_DMESG}" MOUNT_MATRIX="${MOUNT_MATRIX}" ./run.sh || true
+    - ALLOW_DEGRADED="${ALLOW_DEGRADED}" SCAN_DMESG="${SCAN_DMESG}" STRICT_MOUNT_MATRIX="${STRICT_MOUNT_MATRIX}" MOUNT_MATRIX="${MOUNT_MATRIX}" ./run.sh || true
     - $REPO_PATH/Runner/utils/send-to-lava.sh Partition_PostBoot_Validation.res
+
