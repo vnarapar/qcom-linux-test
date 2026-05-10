@@ -28,10 +28,16 @@ else
     echo "[WARNING] Result file missing: $RESULT_FILE" >&2
 fi
 
-# Emit signals in one clean atomic flush
+# Emit signals using shell builtin printf.
+# Do not use cat. Do not touch printk/dmesg.
 if [ -s "$SIGNAL_FILE" ]; then
-    sleep 1  # small delay to let dmesg calm
-    cat "$SIGNAL_FILE"
+    while IFS= read -r signal_line || [ -n "$signal_line" ]; do
+        [ -n "$signal_line" ] || continue
+ 
+        # Blank lines help if previous console output did not end cleanly.
+        # The signal itself is still emitted only once.
+        printf '\n%s\n\n' "$signal_line"
+    done < "$SIGNAL_FILE"
 fi
 
 # Cleanup
