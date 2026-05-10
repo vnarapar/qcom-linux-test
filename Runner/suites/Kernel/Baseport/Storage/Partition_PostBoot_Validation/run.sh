@@ -39,7 +39,12 @@ fi
 . "$TOOLS/functestlib.sh"
 
 TESTNAME="Partition_PostBoot_Validation"
-MOUNT_MATRIX="${MOUNT_MATRIX:-/:ext4,erofs,squashfs:0:0;/efi:autofs,vfat:0:1;/var/lib/tee:ext4:1:0}"
+
+# Legacy/default matrix used by current YAML.
+# When STRICT_MOUNT_MATRIX=0, this legacy matrix is treated as an auto-default
+# so optional platform-specific mounts do not fail on boards where they are not present.
+LEGACY_MOUNT_MATRIX="/:ext4,erofs,squashfs:0:0;/efi:autofs,vfat:0:1;/var/lib/tee:ext4:1:0"
+STRICT_MOUNT_MATRIX="${STRICT_MOUNT_MATRIX:-0}"
 
 test_path="$(find_test_case_by_name "$TESTNAME")"
 if [ -n "$test_path" ]; then
@@ -59,13 +64,48 @@ fi
 
 log_info "--------------------------------------------------------------------------"
 log_info "------------------- Starting $TESTNAME Testcase --------------------------"
-log_info "Mount matrix, $MOUNT_MATRIX"
 
 if command -v detect_platform >/dev/null 2>&1; then
     detect_platform
 fi
 
 log_info "Platform Details: machine='${PLATFORM_MACHINE:-unknown}' target='${PLATFORM_TARGET:-unknown}' kernel='$(uname -r 2>/dev/null || echo unknown)' arch='$(uname -m 2>/dev/null || echo unknown)'"
+
+DEFAULT_MOUNT_MATRIX="/:ext4,erofs,squashfs:0:0"
+
+if partition_mount_exists "/efi"; then
+    DEFAULT_MOUNT_MATRIX="${DEFAULT_MOUNT_MATRIX};/efi:autofs,vfat:0:1"
+    log_info "Auto matrix: /efi mount detected, enabling /efi validation"
+else
+    log_info "Auto matrix: /efi mount not detected, skipping optional /efi validation"
+fi
+
+if partition_mount_exists "/var/lib/tee"; then
+    DEFAULT_MOUNT_MATRIX="${DEFAULT_MOUNT_MATRIX};/var/lib/tee:ext4:1:0"
+    log_info "Auto matrix: /var/lib/tee mount detected, enabling RW validation"
+else
+    log_info "Auto matrix: /var/lib/tee mount not detected, skipping optional /var/lib/tee validation"
+fi
+
+if [ "$STRICT_MOUNT_MATRIX" = "1" ]; then
+    if [ -z "${MOUNT_MATRIX:-}" ]; then
+        MOUNT_MATRIX="$LEGACY_MOUNT_MATRIX"
+    fi
+    log_info "STRICT_MOUNT_MATRIX=1, using mount matrix exactly as provided"
+else
+    if [ -z "${MOUNT_MATRIX:-}" ] || [ "$MOUNT_MATRIX" = "$LEGACY_MOUNT_MATRIX" ]; then
+        if [ -n "${MOUNT_MATRIX:-}" ]; then
+            log_info "Legacy default MOUNT_MATRIX detected, replacing with platform-aware auto matrix"
+        else
+            log_info "No MOUNT_MATRIX provided, using platform-aware auto matrix"
+        fi
+        MOUNT_MATRIX="$DEFAULT_MOUNT_MATRIX"
+    else
+        log_info "Custom MOUNT_MATRIX detected, using it exactly as provided"
+    fi
+fi
+
+log_info "Mount matrix, $MOUNT_MATRIX"
 
 partition_log_current_mounts
 partition_log_block_devices
