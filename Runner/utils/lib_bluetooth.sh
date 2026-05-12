@@ -241,31 +241,85 @@ expect { timeout {} eof {} }
     return 0
 }
 
-# Scan for nearby BT devices using bluetoothctl (no expect).
+# Scan for nearby BT devices using bluetoothctl.
+#
 # Env:
-#   BT_ADAPTER   : adapter (e.g. hci0); auto-detected if unset
-#   SCAN_SECONDS : total scan window (default 10)
-#   MAC_ID       : optional AA:BB:CC:DD:EE:FF; if set, succeed only if seen
+# BT_ADAPTER : adapter, for example hci0; auto-detected if unset
+# SCAN_SECONDS : scan window per attempt, default 10
+# SCAN_ATTEMPTS : scan attempts, default 3
+# SCAN_RETRY_DELAY : delay between attempts, default 2
+# MAC_ID : optional AA:BB:CC:DD:EE:FF; if set, succeed only if seen
+# SCAN_RESULT : optional file to store parsed scan result lines
+#
 # Usage:
-#   bt_scan_devices               # list all devices (prints "MAC NAME" lines)
-#   bt_scan_devices AA:..:FF      # success only if that MAC is seen
+# bt_scan_devices # generic scan, succeeds if any valid MAC is seen
+# bt_scan_devices AA:..:FF # target scan, succeeds only if target MAC is seen
+#
+# Output:
+# MAC NAME
+#
 # Return:
-#   0 on success, 1 on failure (no devices / MAC not found)
+# 0 on success
+# 1 on failure
+#
+# Notes:
+# - Reuses existing helper name; do not add a parallel scan helper.
+# - Parses live bluetoothctl scan output and cached bluetoothctl devices output.
+# - Accepts MAC-only discovery because name resolution can be delayed.
+# - Keeps positional MAC support for existing callers.
 # shellcheck disable=SC2120
 bt_scan_devices() {
     adapter="${BT_ADAPTER:-}"
     scan_window="${SCAN_SECONDS:-10}"
+    scan_attempts="${SCAN_ATTEMPTS:-3}"
+    scan_retry_delay="${SCAN_RETRY_DELAY:-2}"
     mac_id="${MAC_ID:-}"
 
-    # Allow positional MAC as first arg if MAC_ID not set
     if [ -z "$mac_id" ] && [ -n "${1:-}" ]; then
         mac_id="$1"
     fi
 
-    # Detect adapter (hci0, hci1, ...)
-    if [ -z "$adapter" ] && command -v hciconfig >/dev/null 2>&1; then
-        adapter="$(hciconfig 2>/dev/null | awk '/^hci[0-9]+:/ {print $1}' | head -n1)"
+    case "$scan_window" in
+        ""|*[!0-9]*)
+            scan_window=10
+            ;;
+    esac
+
+    case "$scan_attempts" in
+        ""|*[!0-9]*)
+            scan_attempts=3
+            ;;
+    esac
+
+    case "$scan_retry_delay" in
+        ""|*[!0-9]*)
+            scan_retry_delay=2
+            ;;
+    esac
+
+    if [ "$scan_window" -le 0 ] 2>/dev/null; then
+        scan_window=10
     fi
+
+    if [ "$scan_attempts" -le 0 ] 2>/dev/null; then
+        scan_attempts=3
+    fi
+
+    if [ "$scan_retry_delay" -lt 0 ] 2>/dev/null; then
+        scan_retry_delay=2
+    fi
+
+    if [ -z "$adapter" ] && command -v findhcisysfs >/dev/null 2>&1; then
+        adapter="$(findhcisysfs 2>/dev/null || true)"
+    fi
+
+    if [ -z "$adapter" ] && command -v hciconfig >/dev/null 2>&1; then
+        adapter="$(
+            hciconfig 2>/dev/null \
+                | awk '/^hci[0-9]+:/ { print $1; exit }'
+        )"
+    fi
+
     adapter="${adapter%:}"
 
     if [ -z "$adapter" ]; then
@@ -273,112 +327,204 @@ bt_scan_devices() {
         return 1
     fi
 
-    log_info "bt_scan_devices: using adapter $adapter (window=${scan_window}s)"
+    mac_id_up=""
+    if [ -n "$mac_id" ]; then
+        mac_id_up="$(printf '%s\n' "$mac_id" | tr '[:lower:]' '[:upper:]')"
+    fi
 
-    # Make sure adapter is powered on (best-effort)
+    log_info "bt_scan_devices: using adapter $adapter"
+    log_info "bt_scan_devices: scan_window=${scan_window}s attempts=${scan_attempts} retry_delay=${scan_retry_delay}s"
+
     if command -v btpower >/dev/null 2>&1; then
         if ! btpower "$adapter" on; then
-            log_warn "bt_scan_devices: btpower($adapter on) did not report success; continuing anyway"
+            log_warn "bt_scan_devices: btpower($adapter on) did not report success; continuing"
         fi
     else
-        log_info "bt_scan_devices: btpower helper missing, assuming adapter is already powered."
+        bluetoothctl power on >/dev/null 2>&1 || true
     fi
 
-    # Start scan using CLI helper (non-expect)
-    if ! bt_set_scan on; then
-        log_warn "bt_scan_devices: bt_set_scan(on) reported failure; will still poll 'devices'."
-    fi
+    bluetoothctl select "$adapter" >/dev/null 2>&1 || true
 
-    start_ts=$(date +%s 2>/dev/null || printf '%s\n' 0)
-    [ "$scan_window" -le 0 ] 2>/dev/null && scan_window=10
-
+    attempt=1
     found_lines=""
-    seen_target=0
 
-    # Poll 'bluetoothctl devices' for up to scan_window seconds
-    while :; do
-        devices_out="$(
-            bluetoothctl devices 2>/dev/null | sanitize_bt_output || true
+    while [ "$attempt" -le "$scan_attempts" ]; do
+        log_info "bt_scan_devices: scan attempt ${attempt}/${scan_attempts}"
+
+        live_out="$(
+            {
+                bluetoothctl select "$adapter" 2>/dev/null || true
+                bluetoothctl power on 2>/dev/null || true
+                bluetoothctl --timeout "$scan_window" scan on 2>&1 || true
+            } | sanitize_bt_output
         )"
 
-        if [ -n "$devices_out" ]; then
-            # Convert "Device MAC NAME..." → "MAC NAME" lines, unique
-            found_lines="$(
-                printf '%s\n' "$devices_out" | awk '
-                  function is_hex_pair(s,    c1,c2) {
-                    if (length(s)!=2) return 0
-                    c1=substr(s,1,1); c2=substr(s,2,1)
-                    return index("0123456789ABCDEFabcdef", c1) && index("0123456789ABCDEFabcdef", c2)
-                  }
-                  function is_mac(m,    a,n,i) {
-                    n = split(m, a, ":"); if (n!=6) return 0
-                    for (i=1;i<=6;i++) if (!is_hex_pair(a[i])) return 0
-                    return 1
-                  }
-                  /^Device[[:space:]]/ {
-                    mac=$2
-                    if (!is_mac(mac)) next
-                    name=""
-                    for (i=3;i<=NF;i++) name = name (i==3?"":" ") $i
-                    sub(/[[:space:]]+$/,"",name)
-                    if (name=="") next
-                    print mac, name
-                  }
-                ' | sort -u
-            )"
-
-            if [ -n "$found_lines" ]; then
-                if [ -n "$mac_id" ]; then
-                    if printf '%s\n' "$found_lines" \
-                        | awk -v t="$mac_id" 'BEGIN{IGNORECASE=1} $1==t {exit 0} END{exit 1}'
-                    then
-                        seen_target=1
-                        break
-                    fi
-                else
-                    # Any device is enough if no MAC_ID filter
-                    seen_target=1
-                    break
-                fi
+        if command -v bt_set_scan >/dev/null 2>&1; then
+            if ! bt_set_scan off "$adapter"; then
+                log_warn "bt_scan_devices: bt_set_scan(off) reported failure after attempt $attempt"
             fi
+        else
+            bluetoothctl scan off >/dev/null 2>&1 || true
         fi
 
-        # Check timeout
-        now_ts=$(date +%s 2>/dev/null || printf '%s\n' "$scan_window")
-        elapsed=$((now_ts - start_ts))
-        if [ "$elapsed" -ge "$scan_window" ]; then
-            break
+        if command -v bt_list_devices_raw >/dev/null 2>&1; then
+            cache_out="$(
+                bt_list_devices_raw 2>/dev/null \
+                    | sanitize_bt_output || true
+            )"
+        else
+            cache_out="$(
+                bluetoothctl devices 2>/dev/null \
+                    | sanitize_bt_output || true
+            )"
         fi
-        sleep 1
+
+        found_lines="$(
+            {
+                printf '%s\n' "$live_out"
+                printf '%s\n' "$cache_out"
+            } | awk '
+                function is_hex_pair(s) {
+                    return s ~ /^[0-9A-Fa-f][0-9A-Fa-f]$/
+                }
+
+                function is_mac(m, a,n,i) {
+                    n = split(m, a, ":")
+                    if (n != 6) {
+                        return 0
+                    }
+
+                    for (i = 1; i <= 6; i++) {
+                        if (!is_hex_pair(a[i])) {
+                            return 0
+                        }
+                    }
+
+                    return 1
+                }
+
+                function is_property_token(s) {
+                    return s ~ /^(RSSI|UUIDs:|TxPower|ManufacturerData|ManufacturerData\.|Paired|Connected|Advertising|Flags:|ServiceData|Alias:|Class:|Icon:|Modalias:|Services)/
+                }
+
+                function emit_device(mac, name) {
+                    mac = toupper(mac)
+
+                    if (name == "") {
+                        name = "<unknown>"
+                    }
+
+                    if (!(mac in seen)) {
+                        seen[mac] = name
+                        order[++count] = mac
+                    } else if (seen[mac] == "<unknown>" && name != "<unknown>") {
+                        seen[mac] = name
+                    }
+                }
+
+                {
+                    mac = ""
+                    start = 0
+
+                    for (i = 1; i <= NF; i++) {
+                        if ($i == "Device" && (i + 1) <= NF && is_mac($(i + 1))) {
+                            mac = $(i + 1)
+                            start = i + 2
+                            break
+                        }
+                    }
+
+                    if (mac == "") {
+                        next
+                    }
+
+                    name = ""
+                    for (i = start; i <= NF; i++) {
+                        if (is_property_token($i)) {
+                            break
+                        }
+
+                        if ($i == "") {
+                            continue
+                        }
+
+                        name = name (name == "" ? "" : " ") $i
+                    }
+
+                    sub(/[[:space:]]+$/, "", name)
+
+                    if (name ~ /^[0-9A-Fa-f][0-9A-Fa-f]-[0-9A-Fa-f][0-9A-Fa-f]-[0-9A-Fa-f][0-9A-Fa-f]-[0-9A-Fa-f][0-9A-Fa-f]-[0-9A-Fa-f][0-9A-Fa-f]-[0-9A-Fa-f][0-9A-Fa-f]$/) {
+                        name = "<unknown>"
+                    }
+
+                    emit_device(mac, name)
+                }
+
+                END {
+                    for (i = 1; i <= count; i++) {
+                        mac = order[i]
+                        print mac, seen[mac]
+                    }
+                }
+            '
+        )"
+
+        if [ -n "$found_lines" ]; then
+            log_info "bt_scan_devices: devices seen during attempt $attempt"
+            printf '%s\n' "$found_lines" | while IFS= read -r line; do
+                if [ -n "$line" ]; then
+                    log_info " $line"
+                fi
+            done
+
+            if [ -n "${SCAN_RESULT:-}" ]; then
+                printf '%s\n' "$found_lines" > "$SCAN_RESULT"
+            fi
+
+            if [ -n "$mac_id_up" ]; then
+                match_line="$(
+                    printf '%s\n' "$found_lines" \
+                        | awk -v target="$mac_id_up" '
+                            toupper($1) == target {
+                                print
+                                found = 1
+                                exit
+                            }
+
+                            END {
+                                if (found != 1) {
+                                    exit 1
+                                }
+                            }
+                        '
+                )"
+
+                if [ -n "$match_line" ]; then
+                    return 0
+                fi
+
+                log_warn "bt_scan_devices: target MAC not seen in attempt $attempt: $mac_id"
+            else
+                return 0
+            fi
+        else
+            log_warn "bt_scan_devices: no devices parsed in attempt $attempt"
+        fi
+
+        attempt=$((attempt + 1))
+
+        if [ "$attempt" -le "$scan_attempts" ]; then
+            sleep "$scan_retry_delay"
+        fi
     done
 
-    # Stop scan (best-effort)
-    if ! bt_set_scan off; then
-        log_warn "bt_scan_devices: bt_set_scan(off) reported failure"
-    fi
-
-    if [ -z "$found_lines" ]; then
-        log_warn "bt_scan_devices: no devices parsed from 'bluetoothctl devices'"
-        return 1
-    fi
-
     if [ -n "$mac_id" ]; then
-        # Print only the matching line if available
-        match_line="$(
-            printf '%s\n' "$found_lines" \
-            | awk -v t="$mac_id" 'BEGIN{IGNORECASE=1} $1==t {print; exit}'
-        )"
-        if [ -n "$match_line" ]; then
-            printf '%s\n' "$match_line"
-            return 0
-        fi
-        log_warn "bt_scan_devices: MAC_ID not found: $mac_id"
-        return 1
+        log_warn "bt_scan_devices: MAC_ID not found after ${scan_attempts} attempts: $mac_id"
+    else
+        log_warn "bt_scan_devices: no devices found after ${scan_attempts} attempts"
     fi
 
-    # No filter: print all MAC/NAME pairs
-    printf '%s\n' "$found_lines"
-    return 0
+    return 1
 }
 
 # Pair with Bluetooth device using MAC (with retries and timestamped logs)
