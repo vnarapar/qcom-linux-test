@@ -2544,3 +2544,475 @@ audio_probe_alsa_capture_profile() {
   probe_cleanup
   return 1
 }
+
+###############################################################################
+# ALSA sound card registration helpers
+###############################################################################
+audio_card_log_alsa_inventory() {
+  log_info "----- ALSA sound inventory -----"
+
+  if [ -f /proc/asound/cards ]; then
+    log_info "/proc/asound/cards:"
+    while IFS= read -r line || [ -n "$line" ]; do
+      log_info "[asound-cards] $line"
+    done < /proc/asound/cards
+  else
+    log_warn "/proc/asound/cards is missing"
+  fi
+
+  if [ -f /proc/asound/devices ]; then
+    log_info "/proc/asound/devices:"
+    while IFS= read -r line || [ -n "$line" ]; do
+      log_info "[asound-devices] $line"
+    done < /proc/asound/devices
+  else
+    log_warn "/proc/asound/devices is missing"
+  fi
+
+  if [ -f /proc/asound/pcm ]; then
+    log_info "/proc/asound/pcm:"
+    while IFS= read -r line || [ -n "$line" ]; do
+      log_info "[asound-pcm] $line"
+    done < /proc/asound/pcm
+  else
+    log_warn "/proc/asound/pcm is missing"
+  fi
+
+  if [ -d /dev/snd ]; then
+    log_info "/dev/snd:"
+    for audio_snd_path in /dev/snd/*; do
+      [ -e "$audio_snd_path" ] || continue
+
+      if command -v stat >/dev/null 2>&1; then
+        audio_snd_mode="$(stat -c '%A' "$audio_snd_path" 2>/dev/null || printf '%s' '?')"
+        audio_snd_owner="$(stat -c '%U:%G' "$audio_snd_path" 2>/dev/null || printf '%s' '?')"
+        audio_snd_type="$(stat -c '%F' "$audio_snd_path" 2>/dev/null || printf '%s' '?')"
+        log_info "[dev-snd] ${audio_snd_mode} ${audio_snd_owner} ${audio_snd_type} ${audio_snd_path}"
+      else
+        log_info "[dev-snd] ${audio_snd_path}"
+      fi
+    done
+  else
+    log_warn "/dev/snd is missing"
+  fi
+
+  if [ -d /sys/class/sound ]; then
+    log_info "/sys/class/sound:"
+    for audio_sound_path in /sys/class/sound/*; do
+      [ -e "$audio_sound_path" ] || continue
+
+      audio_sound_target=""
+      if [ -L "$audio_sound_path" ] && command -v readlink >/dev/null 2>&1; then
+        audio_sound_target="$(readlink "$audio_sound_path" 2>/dev/null || true)"
+      fi
+
+      if command -v stat >/dev/null 2>&1; then
+        audio_sound_mode="$(stat -c '%A' "$audio_sound_path" 2>/dev/null || printf '%s' '?')"
+        audio_sound_owner="$(stat -c '%U:%G' "$audio_sound_path" 2>/dev/null || printf '%s' '?')"
+        audio_sound_type="$(stat -c '%F' "$audio_sound_path" 2>/dev/null || printf '%s' '?')"
+
+        if [ -n "$audio_sound_target" ]; then
+          log_info "[sys-sound] ${audio_sound_mode} ${audio_sound_owner} ${audio_sound_type} ${audio_sound_path} -> ${audio_sound_target}"
+        else
+          log_info "[sys-sound] ${audio_sound_mode} ${audio_sound_owner} ${audio_sound_type} ${audio_sound_path}"
+        fi
+      else
+        if [ -n "$audio_sound_target" ]; then
+          log_info "[sys-sound] ${audio_sound_path} -> ${audio_sound_target}"
+        else
+          log_info "[sys-sound] ${audio_sound_path}"
+        fi
+      fi
+    done
+  else
+    log_warn "/sys/class/sound is missing"
+  fi
+
+  if command -v aplay >/dev/null 2>&1; then
+    log_info "aplay -l:"
+    aplay -l 2>&1 | while IFS= read -r line || [ -n "$line" ]; do
+      log_info "[aplay] $line"
+    done
+  else
+    log_info "aplay not available, skipping aplay -l dump"
+  fi
+
+  if command -v arecord >/dev/null 2>&1; then
+    log_info "arecord -l:"
+    arecord -l 2>&1 | while IFS= read -r line || [ -n "$line" ]; do
+      log_info "[arecord] $line"
+    done
+  else
+    log_info "arecord not available, skipping arecord -l dump"
+  fi
+
+  log_info "----- End ALSA sound inventory -----"
+}
+
+# Print registered ALSA cards as:
+# card_index|card_id|description
+audio_card_get_registered_cards() {
+  if [ ! -f /proc/asound/cards ]; then
+    return 1
+  fi
+
+  awk '
+    /^[[:space:]]*[0-9]+[[:space:]]+\[/ {
+      idx = $1
+      id = $0
+      desc = $0
+
+      sub(/^[^[]*\[/, "", id)
+      sub(/\].*$/, "", id)
+
+      sub(/^[^:]*:[[:space:]]*/, "", desc)
+
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", id)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", desc)
+
+      print idx "|" id "|" desc
+    }
+  ' /proc/asound/cards
+}
+
+# Return 0 if the card line is dummy/loopback-only.
+audio_card_is_dummy_or_generic() {
+  card_line="$1"
+
+  printf '%s\n' "$card_line" | grep -Eiq 'dummy|loopback|aloop|snd-dummy'
+}
+
+# Print only non-dummy registered cards.
+audio_card_get_valid_cards() {
+  audio_card_get_registered_cards 2>/dev/null | while IFS= read -r card_line || [ -n "$card_line" ]; do
+    [ -n "$card_line" ] || continue
+
+    if audio_card_is_dummy_or_generic "$card_line"; then
+      continue
+    fi
+
+    printf '%s\n' "$card_line"
+  done
+}
+
+# Count non-dummy registered cards.
+audio_card_count_valid_cards() {
+  count="$(audio_card_get_valid_cards 2>/dev/null | wc -l | awk '{print $1}')"
+
+  if [ -z "$count" ]; then
+    count=0
+  fi
+
+  printf '%s\n' "$count"
+}
+
+# Print valid cards matching a case-insensitive substring.
+# Empty match means all valid cards.
+audio_card_find_matching_cards() {
+  match="$1"
+
+  if [ -z "$match" ]; then
+    audio_card_get_valid_cards
+    return $?
+  fi
+
+  audio_card_get_valid_cards 2>/dev/null | awk -v pat="$match" '
+    BEGIN {
+      pat = tolower(pat)
+    }
+    {
+      line = tolower($0)
+      if (index(line, pat) > 0) {
+        print $0
+      }
+    }
+  '
+}
+
+# Return 0 if current DT/sysfs suggests audio card registration is expected.
+audio_card_dt_audio_expected() {
+  if [ -d /sys/class/sound ]; then
+    for card_path in /sys/class/sound/card*; do
+      if [ -e "$card_path" ]; then
+        return 0
+      fi
+    done
+  fi
+
+  if [ ! -d /proc/device-tree ]; then
+    return 1
+  fi
+
+  if find /proc/device-tree -type d \( \
+      -name "sound" -o \
+      -name "*sound*" -o \
+      -name "*audio*" \
+    \) 2>/dev/null | grep -q .; then
+    return 0
+  fi
+
+  compat_match_file="$(mktemp "${TMPDIR:-/tmp}/audio_compat_match.XXXXXX" 2>/dev/null || printf '%s\n' "${TMPDIR:-/tmp}/audio_compat_match.$$")"
+  : > "$compat_match_file" 2>/dev/null || return 1
+
+  find /proc/device-tree -name compatible -type f 2>/dev/null |
+  while IFS= read -r compat_file || [ -n "$compat_file" ]; do
+    [ -n "$compat_file" ] || continue
+
+    if tr '\000' '\n' < "$compat_file" 2>/dev/null | grep -Eiq 'qcom,.*(sound|audio|snd|lpass|wsa|rx-macro|tx-macro|va-macro|codec|swr|soundwire)'; then
+      printf '%s\n' "$compat_file" > "$compat_match_file"
+      break
+    fi
+  done
+
+  if [ -s "$compat_match_file" ]; then
+    rm -f "$compat_match_file" 2>/dev/null || true
+    return 0
+  fi
+
+  rm -f "$compat_match_file" 2>/dev/null || true
+  return 1
+}
+
+# Wait for at least one valid ALSA card, optionally matching AUDIO_CARD_MATCH.
+audio_card_wait_for_cards() {
+  wait_secs="$1"
+  card_match="$2"
+  elapsed=0
+
+  case "$wait_secs" in
+    ''|*[!0-9]*)
+      wait_secs=30
+      ;;
+  esac
+
+  log_info "Waiting up to ${wait_secs}s for ALSA sound card registration"
+
+  while [ "$elapsed" -le "$wait_secs" ]; do
+    if [ -n "$card_match" ]; then
+      if audio_card_find_matching_cards "$card_match" | grep -q .; then
+        return 0
+      fi
+    else
+      card_count="$(audio_card_count_valid_cards)"
+      if [ "$card_count" -gt 0 ] 2>/dev/null; then
+        return 0
+      fi
+    fi
+
+    if [ "$elapsed" -eq "$wait_secs" ]; then
+      break
+    fi
+
+    sleep 1
+    elapsed=$((elapsed + 1))
+
+    case "$elapsed" in
+      5|10|15|20|25|30|45|60)
+        log_info "Still waiting for ALSA card registration, elapsed=${elapsed}s"
+        ;;
+    esac
+  done
+
+  return 1
+}
+
+# Validate /dev/snd/controlC<N> for every matched valid card.
+audio_card_validate_control_nodes() {
+  cards_file="$1"
+  failed=0
+
+  if [ ! -s "$cards_file" ]; then
+    log_fail "No matched ALSA cards provided for control node validation"
+    return 1
+  fi
+
+  while IFS='|' read -r card_idx card_id card_desc || [ -n "$card_idx" ]; do
+    [ -n "$card_idx" ] || continue
+
+    control_node="/dev/snd/controlC${card_idx}"
+
+    if [ -e "$control_node" ]; then
+      log_pass "ALSA control node present for card ${card_idx}, ${control_node}, id='${card_id}', desc='${card_desc}'"
+    else
+      log_fail "Missing ALSA control node for card ${card_idx}, expected ${control_node}, id='${card_id}', desc='${card_desc}'"
+      failed=1
+    fi
+  done < "$cards_file"
+
+  if [ "$failed" -eq 0 ]; then
+    return 0
+  fi
+
+  return 1
+}
+
+# Validate PCM entries for every matched valid card.
+# mode:
+# any - require any PCM for the card
+# playback - require playback PCM
+# capture - require capture PCM
+audio_card_validate_pcm_nodes() {
+  cards_file="$1"
+  mode="$2"
+  failed=0
+  total_checked=0
+  pcm_tmp_file=""
+
+  if [ -z "$mode" ]; then
+    mode="any"
+  fi
+
+  case "$mode" in
+    any|playback|capture)
+      ;;
+    *)
+      log_warn "Invalid PCM validation mode '${mode}', using any"
+      mode="any"
+      ;;
+  esac
+
+  if [ ! -s "$cards_file" ]; then
+    log_fail "No matched ALSA cards provided for PCM validation"
+    return 1
+  fi
+
+  if [ ! -f /proc/asound/pcm ]; then
+    log_fail "/proc/asound/pcm is missing"
+    return 1
+  fi
+
+  pcm_tmp_file="$(mktemp "${TMPDIR:-/tmp}/audio_pcm_lines.XXXXXX" 2>/dev/null || printf '%s\n' "${TMPDIR:-/tmp}/audio_pcm_lines.$$")"
+  : > "$pcm_tmp_file" 2>/dev/null || return 1
+
+  while IFS='|' read -r card_idx card_id card_desc || [ -n "$card_idx" ]; do
+    [ -n "$card_idx" ] || continue
+
+    case "$card_idx" in
+      ''|*[!0-9]*)
+        log_warn "Invalid ALSA card index '${card_idx}', skipping PCM validation for this entry"
+        continue
+        ;;
+    esac
+
+    card_prefix="$(printf '%02d' "$card_idx" 2>/dev/null || printf '%s' "$card_idx")"
+    card_has_pcm=0
+    card_has_mode=0
+    card_checked=0
+
+    grep "^${card_prefix}-" /proc/asound/pcm 2>/dev/null > "$pcm_tmp_file" || true
+
+    if [ ! -s "$pcm_tmp_file" ]; then
+      log_fail "PCM entry missing for card ${card_idx}, id='${card_id}', desc='${card_desc}'"
+      failed=1
+      continue
+    fi
+
+    while IFS= read -r pcm_line || [ -n "$pcm_line" ]; do
+      [ -n "$pcm_line" ] || continue
+
+      card_has_pcm=1
+
+      pcm_dev="$(printf '%s\n' "$pcm_line" | sed -n 's/^[0-9][0-9]-\([0-9][0-9]\):.*/\1/p')"
+      [ -n "$pcm_dev" ] || continue
+
+      pcm_dev_num="$(printf '%s\n' "$pcm_dev" | sed 's/^0*//')"
+      if [ -z "$pcm_dev_num" ]; then
+        pcm_dev_num=0
+      fi
+
+      if printf '%s\n' "$pcm_line" | grep -qi 'playback'; then
+        if [ "$mode" = "any" ] || [ "$mode" = "playback" ]; then
+          card_has_mode=1
+          card_checked=$((card_checked + 1))
+          total_checked=$((total_checked + 1))
+          pcm_node="/dev/snd/pcmC${card_idx}D${pcm_dev_num}p"
+
+          if [ -e "$pcm_node" ]; then
+            if [ "$mode" = "any" ]; then
+              log_pass "Advertised playback PCM node present, ${pcm_node}, card=${card_idx}, id='${card_id}', desc='${card_desc}'"
+            fi
+          else
+            log_fail "Advertised playback PCM node missing, expected ${pcm_node}, line='${pcm_line}', card=${card_idx}, id='${card_id}', desc='${card_desc}'"
+            failed=1
+          fi
+        fi
+      fi
+
+      if printf '%s\n' "$pcm_line" | grep -qi 'capture'; then
+        if [ "$mode" = "any" ] || [ "$mode" = "capture" ]; then
+          card_has_mode=1
+          card_checked=$((card_checked + 1))
+          total_checked=$((total_checked + 1))
+          pcm_node="/dev/snd/pcmC${card_idx}D${pcm_dev_num}c"
+
+          if [ -e "$pcm_node" ]; then
+            if [ "$mode" = "any" ]; then
+              log_pass "Advertised capture PCM node present, ${pcm_node}, card=${card_idx}, id='${card_id}', desc='${card_desc}'"
+            fi
+          else
+            log_fail "Advertised capture PCM node missing, expected ${pcm_node}, line='${pcm_line}', card=${card_idx}, id='${card_id}', desc='${card_desc}'"
+            failed=1
+          fi
+        fi
+      fi
+    done < "$pcm_tmp_file"
+
+    if [ "$mode" = "any" ]; then
+      if [ "$card_has_pcm" -eq 1 ]; then
+        log_pass "PCM entry present for card ${card_idx}, id='${card_id}', desc='${card_desc}'"
+      else
+        log_fail "PCM entry missing for card ${card_idx}, id='${card_id}', desc='${card_desc}'"
+        failed=1
+      fi
+    elif [ "$mode" = "playback" ]; then
+      if [ "$card_has_mode" -eq 1 ]; then
+        log_pass "Playback PCM validation passed for card ${card_idx}, count=${card_checked}, id='${card_id}', desc='${card_desc}'"
+      else
+        log_fail "Playback PCM entry missing for card ${card_idx}, id='${card_id}', desc='${card_desc}'"
+        failed=1
+      fi
+    elif [ "$mode" = "capture" ]; then
+      if [ "$card_has_mode" -eq 1 ]; then
+        log_pass "Capture PCM validation passed for card ${card_idx}, count=${card_checked}, id='${card_id}', desc='${card_desc}'"
+      else
+        log_fail "Capture PCM entry missing for card ${card_idx}, id='${card_id}', desc='${card_desc}'"
+        failed=1
+      fi
+    fi
+  done < "$cards_file"
+
+  rm -f "$pcm_tmp_file" 2>/dev/null || true
+
+  if [ "$total_checked" -eq 0 ]; then
+    log_warn "No advertised PCM device nodes were validated from /proc/asound/pcm, mode=${mode}"
+  else
+    log_info "Validated advertised PCM device nodes, mode=${mode}, count=${total_checked}"
+  fi
+
+  if [ "$failed" -eq 0 ]; then
+    return 0
+  fi
+
+  return 1
+}
+
+# Audio-card focused dmesg scan.
+audio_card_dmesg_scan() {
+  outdir="$1"
+
+  if [ -z "$outdir" ]; then
+    outdir="."
+  fi
+
+  audio_dmesg_modules="snd|asoc|audio|lpass|q6|q6afe|q6asm|q6adm|apr|glink|wsa|rx-macro|tx-macro|va-macro|soundwire|swr|codec|remoteproc"
+  audio_dmesg_benign="dummy regulator|probe deferred|deferred probe pending"
+
+  if command -v scan_dmesg_errors >/dev/null 2>&1; then
+    scan_dmesg_errors \
+      "$outdir" \
+      "$audio_dmesg_modules" \
+      "$audio_dmesg_benign" || true
+  else
+    log_warn "scan_dmesg_errors helper not available, skipping audio dmesg scan"
+  fi
+}
