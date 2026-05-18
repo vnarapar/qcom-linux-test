@@ -1,0 +1,25 @@
+metadata:
+  name: audio-card-registration
+  format: "Lava-Test Test Definition 1.0"
+  description: "Validate Qualcomm ALSA audio card registration after boot"
+  os:
+    - linux
+  scope:
+    - functional
+
+params:
+  AUDIO_CARD_WAIT_SECS: "30"
+  AUDIO_CARD_REQUIRED: "auto"
+  AUDIO_CARD_MATCH: ""
+  REQUIRE_CONTROL_NODE: "1"
+  REQUIRE_PCM_NODE: "1"
+  REQUIRE_PLAYBACK_PCM: "1"
+  REQUIRE_CAPTURE_PCM: "1"
+  DMESG_SCAN: "1"
+
+run:
+  steps:
+    - REPO_PATH=$PWD
+    - cd Runner/suites/Multimedia/Audio/Audio_Card_Registration/
+    - ./run.sh --wait-secs "${AUDIO_CARD_WAIT_SECS}" --required "${AUDIO_CARD_REQUIRED}" --card-match "${AUDIO_CARD_MATCH}" --require-control-node "${REQUIRE_CONTROL_NODE}" --require-pcm-node "${REQUIRE_PCM_NODE}" --require-playback-pcm "${REQUIRE_PLAYBACK_PCM}" --require-capture-pcm "${REQUIRE_CAPTURE_PCM}" --dmesg-scan "${DMESG_SCAN}" || true
+    - $REPO_PATH/Runner/utils/send-to-lava.sh Audio_Card_Registration.res
