@@ -1,7 +1,7 @@
 metadata:
     format: Lava-Test Test Definition 1.0
-    name: AUSanity
-    description: "Baseline AU Sanity test plan"
+    name: irq
+    description: "Validate per-CPU arch_timer interrupt delivery using active pinned CPU workload"
     maintainer:
         - vnarapar@qti.qualcomm.com
     os:
@@ -11,8 +11,15 @@ metadata:
     devices:
         - rb3gen2
 
+params:
+    IRQ_TIMER_PATTERN: "arch_timer"
+    IRQ_WORKLOAD_SECONDS: "5"
+    IRQ_RETRIES: "2"
+    IRQ_SKIP_ISOLATED: "1"
+
 run:
     steps:
-        - cd Runner
-        - $PWD/suites/Kernel/Baseport/irq/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/irq/irq.res || true
+        - REPO_PATH=$PWD
+        - cd Runner/suites/Kernel/Baseport/irq
+        - IRQ_TIMER_PATTERN="${IRQ_TIMER_PATTERN}" IRQ_WORKLOAD_SECONDS="${IRQ_WORKLOAD_SECONDS}" IRQ_RETRIES="${IRQ_RETRIES}" IRQ_SKIP_ISOLATED="${IRQ_SKIP_ISOLATED}" ./run.sh || true
+        - $REPO_PATH/Runner/utils/send-to-lava.sh irq.res
