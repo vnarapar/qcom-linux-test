@@ -1,0 +1,155 @@
+name: Weekly Testkit Snapshot Tag
+
+on:
+  schedule:
+    # Every Sunday evening at 18:00 IST.
+    # GitHub cron uses UTC, so this is Sunday 12:30 UTC.
+    - cron: "30 12 * * 0"
+
+  workflow_dispatch:
+    inputs:
+      tag_date:
+        description: "Optional tag date, format YYYY.MM.DD. Defaults to current UTC date."
+        required: false
+        type: string
+      tag_suffix:
+        description: "Optional correction suffix, for example 1 creates testkit-YYYY.MM.DD-1"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  create-testkit-snapshot-tag:
+    name: Create qcom-linux-testkit snapshot tag
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Compute tag
+        id: tag
+        shell: bash
+        env:
+          TAG_DATE_INPUT: ${{ github.event.inputs.tag_date }}
+          TAG_SUFFIX_INPUT: ${{ github.event.inputs.tag_suffix }}
+        run: |
+          set -euo pipefail
+
+          TAG_DATE="${TAG_DATE_INPUT:-}"
+          TAG_SUFFIX="${TAG_SUFFIX_INPUT:-}"
+
+          if [ -z "$TAG_DATE" ]; then
+            TAG_DATE="$(date -u +'%Y.%m.%d')"
+          fi
+
+          if ! printf '%s\n' "$TAG_DATE" | grep -Eq '^[0-9]{4}\.[0-9]{2}\.[0-9]{2}$'; then
+            echo "Invalid tag_date: $TAG_DATE"
+            echo "Expected format: YYYY.MM.DD"
+            exit 1
+          fi
+
+          TAG="testkit-${TAG_DATE}"
+
+          if [ -n "$TAG_SUFFIX" ]; then
+            if ! printf '%s\n' "$TAG_SUFFIX" | grep -Eq '^[0-9]+$'; then
+              echo "Invalid tag_suffix: $TAG_SUFFIX"
+              echo "Expected numeric suffix, for example: 1"
+              exit 1
+            fi
+
+            TAG="${TAG}-${TAG_SUFFIX}"
+          fi
+
+          {
+            echo "tag=$TAG"
+            echo "date=$TAG_DATE"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Computed tag: $TAG"
+
+      - name: Verify main branch checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CURRENT_BRANCH="$(git branch --show-current)"
+          CURRENT_SHA="$(git rev-parse HEAD)"
+
+          echo "Branch: $CURRENT_BRANCH"
+          echo "Commit: $CURRENT_SHA"
+
+          if [ "$CURRENT_BRANCH" != "main" ]; then
+            echo "This workflow must create snapshot tags from main only"
+            exit 1
+          fi
+
+      - name: Check tag does not already exist
+        shell: bash
+        env:
+          TAG_NAME: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          TAG="$TAG_NAME"
+
+          git fetch --tags origin
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag already exists on origin: $TAG"
+            echo "Published tags must not be force-moved."
+            exit 1
+          fi
+
+      - name: Run basic repository validation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -d Runner
+          test -d Runner/suites
+          test -d Runner/utils
+          test -f README.md
+
+      - name: Create annotated tag
+        shell: bash
+        env:
+          TAG_NAME: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          TAG="$TAG_NAME"
+
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          git tag -a "$TAG" -m "qcom-linux-testkit snapshot ${TAG#testkit-}"
+
+          git show "$TAG" --no-patch
+
+      - name: Push tag
+        shell: bash
+        env:
+          TAG_NAME: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          TAG="$TAG_NAME"
+
+          git push origin "$TAG"
+
+      - name: Verify remote tag
+        shell: bash
+        env:
+          TAG_NAME: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          TAG="$TAG_NAME"
+
+          git ls-remote --tags origin "refs/tags/$TAG"
