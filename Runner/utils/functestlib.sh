@@ -177,6 +177,523 @@ check_dependencies() {
     return 0
 }
 
+###############################################################################
+# CPU and interrupt validation helpers
+###############################################################################
+
+# Return 0 if the input is an unsigned decimal number.
+is_unsigned_number() {
+    unsigned_value="$1"
+
+    case "$unsigned_value" in
+        ''|*[!0-9]*)
+            return 1
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+# Read the first line from a sysfs/procfs file.
+read_first_line() {
+    read_file="$1"
+
+    if [ -r "$read_file" ]; then
+        sed -n '1p' "$read_file" 2>/dev/null
+    fi
+}
+
+# Expand Linux CPU list format.
+#
+# Input examples:
+# 0-7
+# 0,2-3,5
+#
+# Output:
+# one CPU index per line
+expand_cpu_list() {
+    cpu_list="$1"
+
+    printf '%s\n' "$cpu_list" | tr ',' '\n' |
+    while IFS= read -r cpu_range || [ -n "$cpu_range" ]; do
+        [ -n "$cpu_range" ] || continue
+
+        case "$cpu_range" in
+            *-*)
+                cpu_start="${cpu_range%-*}"
+                cpu_end="${cpu_range#*-}"
+
+                if ! is_unsigned_number "$cpu_start" || ! is_unsigned_number "$cpu_end"; then
+                    continue
+                fi
+
+                cpu_index="$cpu_start"
+                while [ "$cpu_index" -le "$cpu_end" ]; do
+                    printf '%s\n' "$cpu_index"
+                    cpu_index=$((cpu_index + 1))
+                done
+                ;;
+            *)
+                if is_unsigned_number "$cpu_range"; then
+                    printf '%s\n' "$cpu_range"
+                fi
+                ;;
+        esac
+    done
+}
+
+# Return 0 if a CPU is present in a Linux CPU list.
+cpu_in_list() {
+    cpu_index="$1"
+    cpu_list="$2"
+
+    [ -n "$cpu_list" ] || return 1
+
+    expand_cpu_list "$cpu_list" | grep -qx "$cpu_index"
+}
+
+# Return online CPUs, one CPU index per line.
+get_online_cpus() {
+    cpu_online_raw="$(read_first_line /sys/devices/system/cpu/online)"
+
+    if [ -n "$cpu_online_raw" ]; then
+        expand_cpu_list "$cpu_online_raw"
+        return 0
+    fi
+
+    awk '
+        NR == 1 {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^CPU[0-9]+$/) {
+                    cpu = $i
+                    sub(/^CPU/, "", cpu)
+                    print cpu
+                }
+            }
+        }
+    ' /proc/interrupts 2>/dev/null
+}
+
+# Return interrupt lines matching a pattern from /proc/interrupts.
+#
+# Keep this helper name because existing irq-style tests already call it.
+# ShellCheck cannot see those external call sites when checking this file alone.
+# shellcheck disable=SC2317
+get_interrupt_line_by_name() {
+    irq_name="$1"
+
+    [ -r /proc/interrupts ] || return 1
+    grep "$irq_name" /proc/interrupts 2>/dev/null
+}
+
+# Return the first matching interrupt line with usable fields.
+get_first_interrupt_line_by_name() {
+    irq_name="$1"
+
+    get_interrupt_line_by_name "$irq_name" | awk 'NF > 2 { print; exit }'
+}
+
+# Return the /proc/interrupts field number for a CPU counter.
+#
+# Header fields:
+# CPU0 CPU1 CPU2 ...
+#
+# Interrupt line fields:
+# IRQ: count0 count1 count2 ...
+#
+# Therefore the data field is header field + 1.
+get_interrupt_cpu_field() {
+    cpu_index="$1"
+
+    awk -v target="CPU${cpu_index}" '
+        NR == 1 {
+            for (i = 1; i <= NF; i++) {
+                if ($i == target) {
+                    print i + 1
+                    exit
+                }
+            }
+        }
+    ' /proc/interrupts 2>/dev/null
+}
+
+# Extract only CPU counter fields from an interrupt line.
+#
+# Keep this helper name because existing irq-style tests already call it.
+# This is a library API and may be called only from external run.sh files.
+# shellcheck disable=SC2317
+extract_interrupt_cpu_counts() {
+    interrupt_line="$1"
+
+    awk -v input_line="$interrupt_line" '
+        BEGIN {
+            gsub(/^[[:space:]]+/, "", input_line)
+            split(input_line, vals, /[[:space:]]+/)
+        }
+        NR == 1 {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^CPU[0-9]+$/) {
+                    field = i + 1
+                    if (vals[field] ~ /^[0-9]+$/) {
+                        print vals[field]
+                    }
+                }
+            }
+            exit
+        }
+    ' /proc/interrupts 2>/dev/null
+}
+
+# Count extracted interrupt CPU counters.
+#
+# Keep this helper name because existing irq-style tests already call it.
+# This is a library API and may be called only from external run.sh files.
+# shellcheck disable=SC2317
+count_interrupt_cpu_counts() {
+    interrupt_values="$1"
+
+    printf '%s\n' "$interrupt_values" |
+    awk 'NF { count++ } END { print count + 0 }'
+}
+
+# Return one interrupt count for one CPU.
+get_interrupt_cpu_count() {
+    irq_name="$1"
+    cpu_index="$2"
+
+    irq_field="$(get_interrupt_cpu_field "$cpu_index")"
+    irq_line="$(get_first_interrupt_line_by_name "$irq_name")"
+
+    if [ -z "$irq_field" ] || [ -z "$irq_line" ]; then
+        return 1
+    fi
+
+    printf '%s\n' "$irq_line" | awk -v field="$irq_field" '{ print $field }'
+}
+
+# Compute interrupt counter delta.
+#
+# Prints:
+# final - initial
+# -1 if final < initial, usually indicating hotplug/reset/race
+interrupt_counter_delta() {
+    initial_count="$1"
+    final_count="$2"
+
+    awk -v initial="$initial_count" -v final="$final_count" '
+        BEGIN {
+            if (final >= initial) {
+                print final - initial
+            } else {
+                print -1
+            }
+        }
+    '
+}
+
+# Return 0 if taskset can schedule a trivial task on the CPU.
+#
+# Return:
+# 0 - CPU is schedulable
+# 1 - taskset exists, but CPU is not schedulable
+# 2 - taskset is missing
+cpu_is_schedulable() {
+    cpu_index="$1"
+
+    if ! command -v taskset >/dev/null 2>&1; then
+        log_warn "taskset command is not available; cannot verify CPU$cpu_index schedulability"
+        return 2
+    fi
+
+    if taskset -c "$cpu_index" sh -c 'true' >/dev/null 2>&1; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Run bounded workload pinned to one CPU.
+#
+# This intentionally starts:
+# 1. a busy loop
+# 2. a sleep/wakeup loop
+#
+# Return:
+# 0 - workload was launched and stopped
+# 1 - invalid input or workload could not be launched
+# 2 - taskset is missing
+run_pinned_cpu_workload() {
+    cpu_index="$1"
+    workload_seconds="$2"
+
+    if ! command -v taskset >/dev/null 2>&1; then
+        log_warn "taskset command is not available; cannot run pinned workload on CPU$cpu_index"
+        return 2
+    fi
+
+    if ! is_unsigned_number "$cpu_index"; then
+        log_warn "Invalid CPU index for pinned workload: ${cpu_index:-<empty>}"
+        return 1
+    fi
+
+    if ! is_unsigned_number "$workload_seconds"; then
+        log_warn "Invalid workload duration for CPU$cpu_index: ${workload_seconds:-<empty>}"
+        return 1
+    fi
+
+    if ! taskset -c "$cpu_index" sh -c 'true' >/dev/null 2>&1; then
+        log_warn "CPU$cpu_index is not schedulable with taskset"
+        return 1
+    fi
+
+    taskset -c "$cpu_index" sh -c 'while :; do :; done' >/dev/null 2>&1 &
+    busy_pid=$!
+
+    taskset -c "$cpu_index" sh -c 'while :; do sleep 1; done' >/dev/null 2>&1 &
+    sleeper_pid=$!
+
+    sleep "$workload_seconds"
+
+    kill "$busy_pid" "$sleeper_pid" >/dev/null 2>&1
+    wait "$busy_pid" >/dev/null 2>&1
+    wait "$sleeper_pid" >/dev/null 2>&1
+
+    return 0
+}
+
+# Log CPU topology and timer/tick diagnostics.
+#
+# Diagnostic only. Never fail based on nohz_full/isolated here.
+log_cpu_irq_diagnostics() {
+    irq_name="$1"
+
+    cpu_online_raw="$(read_first_line /sys/devices/system/cpu/online)"
+    cpu_possible_raw="$(read_first_line /sys/devices/system/cpu/possible)"
+    cpu_isolated_raw="$(read_first_line /sys/devices/system/cpu/isolated)"
+    cpu_nohz_raw="$(read_first_line /sys/devices/system/cpu/nohz_full)"
+
+    log_info "CPU online list: ${cpu_online_raw:-<unavailable>}"
+    log_info "CPU possible list: ${cpu_possible_raw:-<unavailable>}"
+    log_info "CPU isolated list: ${cpu_isolated_raw:-<none>}"
+    log_info "CPU nohz_full list: ${cpu_nohz_raw:-<none>}"
+
+    if [ -r /proc/self/status ]; then
+        cpu_affinity="$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' /proc/self/status | head -n 1)"
+        log_info "Current process Cpus_allowed_list: ${cpu_affinity:-<unavailable>}"
+    fi
+
+    log_info "Detected interrupt lines matching '${irq_name}':"
+    get_interrupt_line_by_name "$irq_name" |
+    while IFS= read -r irq_line || [ -n "$irq_line" ]; do
+        [ -n "$irq_line" ] || continue
+        log_info "$irq_line"
+    done
+}
+
+# Actively validate that a named per-CPU interrupt increments while each
+# online/schedulable CPU is executing pinned workload.
+#
+# Arguments:
+# $1 - interrupt name/pattern, for example arch_timer
+# $2 - workload seconds
+# $3 - retries
+# $4 - skip isolated CPUs: 1=yes, 0=no
+#
+# Sets summary globals:
+# IRQ_ACTIVE_TESTED
+# IRQ_ACTIVE_PASSED
+# IRQ_ACTIVE_FAILED
+# IRQ_ACTIVE_SKIPPED
+# IRQ_ACTIVE_SKIP_REASON
+#
+# Return:
+# 0 - all tested CPUs passed
+# 1 - interrupt missing, no CPUs testable, or at least one tested CPU failed
+# 2 - unsupported environment, for example taskset missing
+validate_per_cpu_interrupt_active() {
+    irq_name="$1"
+    workload_seconds="$2"
+    retries="$3"
+    skip_isolated="$4"
+
+    IRQ_ACTIVE_TESTED=0
+    IRQ_ACTIVE_PASSED=0
+    IRQ_ACTIVE_FAILED=0
+    IRQ_ACTIVE_SKIPPED=0
+    IRQ_ACTIVE_SKIP_REASON=""
+
+    if [ -z "$irq_name" ]; then
+        log_fail "Interrupt name is empty"
+        return 1
+    fi
+
+    if ! is_unsigned_number "$workload_seconds"; then
+        workload_seconds=5
+    fi
+
+    if ! is_unsigned_number "$retries"; then
+        retries=2
+    fi
+
+    case "$skip_isolated" in
+        0|1)
+            ;;
+        *)
+            skip_isolated=1
+            ;;
+    esac
+
+    if ! command -v taskset >/dev/null 2>&1; then
+        IRQ_ACTIVE_SKIP_REASON="taskset command is not available"
+        log_skip "$IRQ_ACTIVE_SKIP_REASON; active per-CPU interrupt validation is unsupported"
+        return 2
+    fi
+
+    if [ ! -r /proc/interrupts ]; then
+        log_fail "/proc/interrupts is not readable"
+        return 1
+    fi
+
+    log_cpu_irq_diagnostics "$irq_name"
+
+    active_irq_line="$(get_first_interrupt_line_by_name "$irq_name")"
+    if [ -z "$active_irq_line" ]; then
+        log_fail "$irq_name interrupt line not found in /proc/interrupts"
+        return 1
+    fi
+
+    online_cpus="$(get_online_cpus)"
+    if [ -z "$online_cpus" ]; then
+        log_fail "No online CPUs detected"
+        return 1
+    fi
+
+    log_info "Online CPUs selected for active interrupt validation:"
+    printf '%s\n' "$online_cpus" |
+    while IFS= read -r cpu_index || [ -n "$cpu_index" ]; do
+        [ -n "$cpu_index" ] || continue
+        log_info "CPU$cpu_index"
+    done
+
+    isolated_cpus="$(read_first_line /sys/devices/system/cpu/isolated)"
+    nohz_full_cpus="$(read_first_line /sys/devices/system/cpu/nohz_full)"
+
+    for cpu_index in $online_cpus; do
+        log_info "Testing CPU$cpu_index '$irq_name' increment under pinned workload"
+
+        if [ "$skip_isolated" -eq 1 ] && cpu_in_list "$cpu_index" "$isolated_cpus"; then
+            log_skip "CPU$cpu_index is isolated; skipping active interrupt validation"
+            IRQ_ACTIVE_SKIPPED=$((IRQ_ACTIVE_SKIPPED + 1))
+            continue
+        fi
+
+        if cpu_in_list "$cpu_index" "$nohz_full_cpus"; then
+            log_warn "CPU$cpu_index is listed in nohz_full; passive idle-tick assumptions are invalid"
+        fi
+
+        irq_field="$(get_interrupt_cpu_field "$cpu_index")"
+        if [ -z "$irq_field" ]; then
+            log_skip "CPU$cpu_index has no matching /proc/interrupts CPU column; skipping"
+            IRQ_ACTIVE_SKIPPED=$((IRQ_ACTIVE_SKIPPED + 1))
+            continue
+        fi
+
+        cpu_is_schedulable "$cpu_index"
+        sched_rc=$?
+
+        if [ "$sched_rc" -eq 2 ]; then
+            IRQ_ACTIVE_SKIP_REASON="taskset command is not available"
+            log_skip "$IRQ_ACTIVE_SKIP_REASON; active per-CPU interrupt validation is unsupported"
+            return 2
+        fi
+
+        if [ "$sched_rc" -ne 0 ]; then
+            log_skip "CPU$cpu_index is not schedulable with taskset; skipping"
+            IRQ_ACTIVE_SKIPPED=$((IRQ_ACTIVE_SKIPPED + 1))
+            continue
+        fi
+
+        IRQ_ACTIVE_TESTED=$((IRQ_ACTIVE_TESTED + 1))
+        attempt=1
+        cpu_pass=0
+
+        while [ "$attempt" -le "$retries" ]; do
+            initial_count="$(get_interrupt_cpu_count "$irq_name" "$cpu_index")"
+
+            if ! is_unsigned_number "$initial_count"; then
+                log_fail "CPU$cpu_index attempt $attempt: could not read numeric initial '$irq_name' count"
+                break
+            fi
+
+            log_info "CPU$cpu_index attempt $attempt: initial count=$initial_count"
+
+            run_pinned_cpu_workload "$cpu_index" "$workload_seconds"
+            workload_rc=$?
+
+            if [ "$workload_rc" -eq 2 ]; then
+                IRQ_ACTIVE_SKIP_REASON="taskset command is not available"
+                log_skip "$IRQ_ACTIVE_SKIP_REASON; active per-CPU interrupt validation is unsupported"
+                return 2
+            fi
+
+            if [ "$workload_rc" -ne 0 ]; then
+                log_fail "CPU$cpu_index attempt $attempt: failed to run pinned workload"
+                break
+            fi
+
+            final_count="$(get_interrupt_cpu_count "$irq_name" "$cpu_index")"
+
+            if ! is_unsigned_number "$final_count"; then
+                log_fail "CPU$cpu_index attempt $attempt: could not read numeric final '$irq_name' count"
+                break
+            fi
+
+            irq_delta="$(interrupt_counter_delta "$initial_count" "$final_count")"
+
+            log_info "CPU$cpu_index attempt $attempt: final count=$final_count delta=$irq_delta"
+
+            if awk -v delta="$irq_delta" 'BEGIN { exit !(delta > 0) }'; then
+                log_pass "CPU$cpu_index: '$irq_name' incremented under pinned workload"
+                cpu_pass=1
+                break
+            fi
+
+            if [ "$irq_delta" = "-1" ]; then
+                log_warn "CPU$cpu_index: '$irq_name' count decreased, possible CPU hotplug/reset during test"
+            else
+                log_warn "CPU$cpu_index: '$irq_name' did not increment on attempt $attempt"
+            fi
+
+            attempt=$((attempt + 1))
+
+            if [ "$attempt" -le "$retries" ]; then
+                sleep 1
+            fi
+        done
+
+        if [ "$cpu_pass" -eq 1 ]; then
+            IRQ_ACTIVE_PASSED=$((IRQ_ACTIVE_PASSED + 1))
+        else
+            log_fail "CPU$cpu_index: '$irq_name' did not increment after $retries attempt(s)"
+            IRQ_ACTIVE_FAILED=$((IRQ_ACTIVE_FAILED + 1))
+        fi
+    done
+
+    log_info "IRQ_ACTIVE_SUMMARY: tested=$IRQ_ACTIVE_TESTED passed=$IRQ_ACTIVE_PASSED failed=$IRQ_ACTIVE_FAILED skipped=$IRQ_ACTIVE_SKIPPED"
+
+    if [ "$IRQ_ACTIVE_TESTED" -eq 0 ]; then
+        log_fail "No CPUs were testable for '$irq_name'"
+        return 1
+    fi
+
+    if [ "$IRQ_ACTIVE_FAILED" -eq 0 ]; then
+        return 0
+    fi
+
+    return 1
+}
+
 # --- Test case directory lookup ---
 find_test_case_by_name() {
     test_name=$1
