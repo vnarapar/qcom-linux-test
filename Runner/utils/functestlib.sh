@@ -5351,3 +5351,359 @@ partition_log_block_devices() {
     log_info "----- End block device inventory -----"
     return 0
 }
+
+###############################################################################
+# CPU hotplug validation helpers
+###############################################################################
+# Return 0 if the input is an unsigned decimal number.
+# shellcheck disable=SC2317
+is_unsigned_number() {
+    value="$1"
+
+    case "$value" in
+        ''|*[!0-9]*)
+            return 1
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+# Read the first line from a sysfs/procfs file.
+# shellcheck disable=SC2317
+read_first_line() {
+    file="$1"
+
+    if [ -r "$file" ]; then
+        sed -n '1p' "$file" 2>/dev/null
+    fi
+}
+
+# Expand Linux CPU list format.
+#
+# Input examples:
+# 0-7
+# 0,2-3,5
+#
+# Output:
+# one CPU index per line
+# shellcheck disable=SC2317
+expand_cpu_list() {
+    list="$1"
+
+    printf '%s\n' "$list" | tr ',' '\n' |
+    while IFS= read -r range || [ -n "$range" ]; do
+        [ -n "$range" ] || continue
+
+        case "$range" in
+            *-*)
+                start="${range%-*}"
+                end="${range#*-}"
+
+                if ! is_unsigned_number "$start" || ! is_unsigned_number "$end"; then
+                    continue
+                fi
+
+                cpu="$start"
+                while [ "$cpu" -le "$end" ]; do
+                    printf '%s\n' "$cpu"
+                    cpu=$((cpu + 1))
+                done
+                ;;
+            *)
+                if is_unsigned_number "$range"; then
+                    printf '%s\n' "$range"
+                fi
+                ;;
+        esac
+    done
+}
+
+# Return 0 if a CPU is listed in a Linux CPU list.
+# shellcheck disable=SC2317
+cpu_in_list() {
+    cpu="$1"
+    list="$2"
+
+    [ -n "$list" ] || return 1
+
+    expand_cpu_list "$list" | grep -qx "$cpu"
+}
+
+# Return online CPUs, one CPU index per line.
+# shellcheck disable=SC2317
+get_online_cpus() {
+    online="$(read_first_line /sys/devices/system/cpu/online)"
+
+    if [ -n "$online" ]; then
+        expand_cpu_list "$online"
+        return 0
+    fi
+
+    awk '
+        NR == 1 {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^CPU[0-9]+$/) {
+                    cpu = $i
+                    sub(/^CPU/, "", cpu)
+                    print cpu
+                }
+            }
+        }
+    ' /proc/interrupts 2>/dev/null
+}
+
+# Return 0 if taskset can schedule a trivial task on the CPU.
+#
+# Return:
+# 0 - CPU is schedulable
+# 1 - taskset exists, but CPU is not schedulable
+# 2 - taskset is missing
+# shellcheck disable=SC2317
+cpu_is_schedulable() {
+    cpu="$1"
+
+    if ! command -v taskset >/dev/null 2>&1; then
+        log_warn "taskset command is not available; cannot verify CPU$cpu schedulability"
+        return 2
+    fi
+
+    if taskset -c "$cpu" sh -c 'true' >/dev/null 2>&1; then
+        return 0
+    fi
+
+    return 1
+}
+
+# Return CPU online control path.
+# shellcheck disable=SC2317
+cpu_hotplug_control_file() {
+    cpu_index="$1"
+
+    printf '%s\n' "/sys/devices/system/cpu/cpu${cpu_index}/online"
+}
+
+# Return 0 if CPU appears in current online CPU mask.
+# shellcheck disable=SC2317
+cpu_hotplug_in_online_mask() {
+    cpu_index="$1"
+    online_raw="$(read_first_line /sys/devices/system/cpu/online)"
+
+    cpu_in_list "$cpu_index" "$online_raw"
+}
+
+# Read cpuX/online state.
+# shellcheck disable=SC2317
+cpu_hotplug_read_state() {
+    cpu_index="$1"
+    online_file="$(cpu_hotplug_control_file "$cpu_index")"
+
+    read_first_line "$online_file"
+}
+
+# Write cpuX/online state and save stderr to out_dir.
+#
+# Arguments:
+# $1 - CPU index
+# $2 - state: 0 or 1
+# $3 - action tag
+# $4 - output directory
+# shellcheck disable=SC2317
+cpu_hotplug_write_state() {
+    cpu_index="$1"
+    cpu_state="$2"
+    action_tag="$3"
+    out_dir="$4"
+    online_file="$(cpu_hotplug_control_file "$cpu_index")"
+    err_file="$out_dir/hotplug_cpu${cpu_index}_${action_tag}.err"
+
+    rm -f "$err_file" 2>/dev/null
+
+    if (printf '%s\n' "$cpu_state" > "$online_file") 2>"$err_file"; then
+        return 0
+    fi
+
+    if [ -s "$err_file" ]; then
+        cat "$err_file"
+    fi
+
+    return 1
+}
+
+# Save and print a small dmesg tail for hotplug evidence.
+#
+# Arguments:
+# $1 - CPU index
+# $2 - tag
+# $3 - output directory
+# shellcheck disable=SC2317
+cpu_hotplug_log_dmesg_tail() {
+    cpu_index="$1"
+    tag="$2"
+    out_dir="$3"
+    dmesg_file="$out_dir/hotplug_cpu${cpu_index}_${tag}_dmesg.txt"
+
+    if command -v dmesg >/dev/null 2>&1; then
+        dmesg | tail -n 120 > "$dmesg_file" 2>/dev/null
+        log_info "Saved dmesg tail for CPU$cpu_index $tag: $dmesg_file"
+
+        tail -n 20 "$dmesg_file" 2>/dev/null |
+        while IFS= read -r dmesg_line || [ -n "$dmesg_line" ]; do
+            [ -n "$dmesg_line" ] || continue
+            log_info "[dmesg] $dmesg_line"
+        done
+    else
+        log_warn "dmesg command not available; cannot collect CPU$cpu_index $tag evidence"
+    fi
+}
+
+# Reset registered offlined CPU list.
+# shellcheck disable=SC2317
+cpu_hotplug_reset_registry() {
+    CPU_HOTPLUG_OFFLINED_CPUS=""
+}
+
+# Record a CPU that was successfully offlined so cleanup can restore it.
+# shellcheck disable=SC2317
+cpu_hotplug_record_offlined_cpu() {
+    cpu_index="$1"
+
+    for saved_cpu in $CPU_HOTPLUG_OFFLINED_CPUS; do
+        if [ "$saved_cpu" = "$cpu_index" ]; then
+            return 0
+        fi
+    done
+
+    CPU_HOTPLUG_OFFLINED_CPUS="${CPU_HOTPLUG_OFFLINED_CPUS} ${cpu_index}"
+}
+
+# Restore one CPU online, best effort.
+# shellcheck disable=SC2317
+cpu_hotplug_restore_best_effort() {
+    cpu_index="$1"
+    online_file="$(cpu_hotplug_control_file "$cpu_index")"
+
+    if [ -w "$online_file" ]; then
+        if ! (printf '%s\n' 1 > "$online_file") 2>/dev/null; then
+            :
+        fi
+    fi
+}
+
+# Restore all CPUs recorded by cpu_hotplug_record_offlined_cpu().
+# shellcheck disable=SC2317
+cpu_hotplug_cleanup_registered() {
+    for cpu_index in $CPU_HOTPLUG_OFFLINED_CPUS; do
+        cpu_state="$(cpu_hotplug_read_state "$cpu_index")"
+
+        if [ "$cpu_state" = "0" ]; then
+            log_warn "Cleanup: CPU$cpu_index is still offline, restoring online"
+            cpu_hotplug_restore_best_effort "$cpu_index"
+        fi
+    done
+}
+
+# Try to offline a CPU with retry handling.
+#
+# Arguments:
+# $1 - CPU index
+# $2 - retry count
+# $3 - retry delay seconds
+# $4 - output directory
+#
+# Return:
+# 0 - offline request accepted
+# 1 - offline failed after retry/evidence collection
+# shellcheck disable=SC2317
+cpu_hotplug_try_offline_with_retry() {
+    cpu_index="$1"
+    retries="$2"
+    retry_delay="$3"
+    out_dir="$4"
+    attempt=1
+
+    while [ "$attempt" -le "$retries" ]; do
+        log_info "CPU$cpu_index offline attempt $attempt/$retries"
+
+        offline_output="$(cpu_hotplug_write_state "$cpu_index" 0 "offline_attempt${attempt}" "$out_dir" 2>&1)"
+        offline_rc=$?
+
+        if [ "$offline_rc" -eq 0 ]; then
+            log_info "CPU$cpu_index offline request accepted on attempt $attempt"
+            return 0
+        fi
+
+        log_warn "CPU$cpu_index offline attempt $attempt failed: ${offline_output:-<no stderr>}"
+
+        if printf '%s\n' "$offline_output" | grep -qi 'Device or resource busy'; then
+            log_warn "CPU$cpu_index offline returned EBUSY"
+            cpu_hotplug_log_dmesg_tail "$cpu_index" "offline_ebusy_attempt${attempt}" "$out_dir"
+        else
+            log_fail "CPU$cpu_index offline failed with non-EBUSY error"
+            cpu_hotplug_log_dmesg_tail "$cpu_index" "offline_error_attempt${attempt}" "$out_dir"
+            return 1
+        fi
+
+        attempt=$((attempt + 1))
+
+        if [ "$attempt" -le "$retries" ]; then
+            log_info "Waiting ${retry_delay}s before retrying CPU$cpu_index offline"
+            sleep "$retry_delay"
+        fi
+    done
+
+    log_fail "CPU$cpu_index offline returned EBUSY after $retries attempts"
+    log_fail "CI requires runtime-discovered hotplug-controllable CPUs to support offline/online transition"
+    return 1
+}
+
+# Log topology details for one CPU.
+# shellcheck disable=SC2317
+cpu_hotplug_log_cpu_topology_one() {
+    cpu_index="$1"
+    cpu_dir="/sys/devices/system/cpu/cpu${cpu_index}"
+    online_file="$(cpu_hotplug_control_file "$cpu_index")"
+
+    package_id="$(read_first_line "$cpu_dir/topology/physical_package_id")"
+    cluster_id="$(read_first_line "$cpu_dir/topology/cluster_id")"
+    core_id="$(read_first_line "$cpu_dir/topology/core_id")"
+    thread_siblings="$(read_first_line "$cpu_dir/topology/thread_siblings_list")"
+    core_siblings="$(read_first_line "$cpu_dir/topology/core_siblings_list")"
+    capacity="$(read_first_line "$cpu_dir/cpu_capacity")"
+    max_freq="$(read_first_line "$cpu_dir/cpufreq/cpuinfo_max_freq")"
+
+    hotplug_control="no"
+    writable="no"
+
+    if [ -e "$online_file" ]; then
+        hotplug_control="yes"
+    fi
+
+    if [ -w "$online_file" ]; then
+        writable="yes"
+    fi
+
+    log_info "CPU$cpu_index topology: hotplug_control=$hotplug_control writable=$writable package=${package_id:-NA} cluster=${cluster_id:-NA} core=${core_id:-NA} capacity=${capacity:-NA} max_freq=${max_freq:-NA} thread_siblings=${thread_siblings:-NA} core_siblings=${core_siblings:-NA}"
+}
+
+# Log global CPU topology and affinity diagnostics.
+# shellcheck disable=SC2317
+cpu_hotplug_log_topology() {
+    online_raw="$(read_first_line /sys/devices/system/cpu/online)"
+    possible_raw="$(read_first_line /sys/devices/system/cpu/possible)"
+    present_raw="$(read_first_line /sys/devices/system/cpu/present)"
+    isolated_raw="$(read_first_line /sys/devices/system/cpu/isolated)"
+    nohz_raw="$(read_first_line /sys/devices/system/cpu/nohz_full)"
+
+    log_info "CPU online list: ${online_raw:-<unavailable>}"
+    log_info "CPU possible list: ${possible_raw:-<unavailable>}"
+    log_info "CPU present list: ${present_raw:-<unavailable>}"
+    log_info "CPU isolated list: ${isolated_raw:-<none>}"
+    log_info "CPU nohz_full list: ${nohz_raw:-<none>}"
+
+    if [ -r /proc/self/status ]; then
+        affinity="$(sed -n 's/^Cpus_allowed_list:[[:space:]]*//p' /proc/self/status | head -n 1)"
+        log_info "Current process Cpus_allowed_list: ${affinity:-<unavailable>}"
+    fi
+}
