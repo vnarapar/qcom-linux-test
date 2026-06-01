@@ -1,7 +1,7 @@
 metadata:
   name: bt-on-off
   format: "Lava-Test Test Definition 1.0"
-  description: "Toggle Bluetooth on/off using qcom-linux-testkit BT_ON_FF"
+  description: "Toggle Bluetooth on/off using qcom-linux-testkit BT_ON_OFF"
   os:
     - linux
   scope:
@@ -9,10 +9,14 @@ metadata:
 
 params:
   BT_ADAPTER: ""
+  BT_POWER_CYCLE_DELAY: "10"
+  BT_POWER_ON_ATTEMPTS: "2"
+  BT_POWER_ON_RETRY_DELAY: "10"
+  BT_RESTART_SERVICE_ON_RETRY: "1"
 
 run:
   steps:
     - REPO_PATH=$PWD
     - cd Runner/suites/Connectivity/Bluetooth/BT_ON_OFF
-    - ./run.sh --adapter "${BT_ADAPTER}" || true
+    - ./run.sh --adapter "${BT_ADAPTER}" --power-cycle-delay "${BT_POWER_CYCLE_DELAY}" --power-on-attempts "${BT_POWER_ON_ATTEMPTS}" --power-on-retry-delay "${BT_POWER_ON_RETRY_DELAY}" --restart-service-on-retry "${BT_RESTART_SERVICE_ON_RETRY}" || true
     - $REPO_PATH/Runner/utils/send-to-lava.sh BT_ON_OFF.res

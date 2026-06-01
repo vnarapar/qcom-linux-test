@@ -912,41 +912,194 @@ btcontrollerpresentplain() {
         | grep -qi '^[[:space:]]*Controller[[:space:]]'
 }
 
-# Log useful diagnostics when bluetoothctl list/controller visibility is flaky.
+# Log useful Bluetooth diagnostics.
+#
+# Usage:
+# btloghcidiag [adapter] [mode] [test_path]
+#
+# Modes:
+# basic - lightweight diagnostics for controller visibility warnings
+# failure - full diagnostics for real BT test failures
+#
+# test_path:
+# Optional path passed to scan_dmesg_errors when mode=failure.
 btloghcidiag() {
     adapter="${1:-}"
+    diag_mode="${2:-basic}"
+    diag_test_path="${3:-}"
+    bt_dmesg_modules="bluetooth|hci0|qca|wcn|btqca|hci_uart|serdev|rfkill|firmware|timeout"
 
-    log_warn "Bluetooth diagnostics: controller visibility is inconsistent"
+    log_warn "Bluetooth diagnostics: controller visibility/state is inconsistent"
 
     if [ -n "$adapter" ]; then
         log_warn "Adapter: $adapter"
     fi
 
     if command -v hciconfig >/dev/null 2>&1; then
-        out="$(hciconfig 2>/dev/null || true)"
-        if [ -z "$out" ]; then
-            log_warn "hciconfig output is empty (HCI attach may be incomplete). Check bluetooth.service + journalctl."
+        if [ "$diag_mode" = "failure" ]; then
+            hci_out="$(hciconfig -a 2>/dev/null || true)"
+            log_warn "hciconfig -a output:"
         else
+            hci_out="$(hciconfig 2>/dev/null || true)"
             log_warn "hciconfig output:"
-            printf '%s\n' "$out" | sanitize_bt_output | sed 's/^/[BT-DIAG] /'
+        fi
+
+        if [ -n "$hci_out" ]; then
+            printf '%s\n' "$hci_out" |
+                sanitize_bt_output |
+                sed 's/^/[BT-DIAG] /'
+        else
+            log_warn "hciconfig output is empty. HCI attach may be incomplete."
         fi
     else
         log_warn "hciconfig not found; cannot dump HCI state"
     fi
 
+    if command -v bluetoothctl >/dev/null 2>&1; then
+        log_warn "bluetoothctl list:"
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 5 bluetoothctl list 2>&1 |
+                sanitize_bt_output |
+                sed 's/^/[BT-DIAG] /' || true
+        else
+            bluetoothctl list 2>&1 |
+                sanitize_bt_output |
+                sed 's/^/[BT-DIAG] /' || true
+        fi
+
+        log_warn "bluetoothctl show:"
+        if command -v timeout >/dev/null 2>&1; then
+            timeout 5 bluetoothctl show 2>&1 |
+                sanitize_bt_output |
+                sed 's/^/[BT-DIAG] /' || true
+        else
+            bluetoothctl show 2>&1 |
+                sanitize_bt_output |
+                sed 's/^/[BT-DIAG] /' || true
+        fi
+    else
+        log_warn "bluetoothctl not found; cannot dump controller state"
+    fi
+
+    if [ "$diag_mode" != "failure" ]; then
+        return 0
+    fi
+
+    if command -v rfkill >/dev/null 2>&1; then
+        log_warn "rfkill list:"
+        rfkill list 2>&1 |
+            sed 's/^/[BT-DIAG] /' || true
+    else
+        log_warn "rfkill not found; cannot dump rfkill state"
+    fi
+
     if command -v systemctl >/dev/null 2>&1; then
-        log_warn "systemctl status bluetooth:"
-        systemctl status bluetooth --no-pager 2>/dev/null | sed 's/^/[BT-DIAG] /' || true
+        log_warn "systemctl status bluetooth --no-pager:"
+        systemctl status bluetooth --no-pager 2>&1 |
+            sed 's/^/[BT-DIAG] /' || true
     else
         log_warn "systemctl not found; cannot dump bluetooth.service status"
     fi
 
     if command -v journalctl >/dev/null 2>&1; then
-        log_warn "journalctl -u bluetooth -b (tail):"
-        journalctl -u bluetooth -b --no-pager 2>/dev/null | tail -n 60 | sed 's/^/[BT-DIAG] /' || true
+        log_warn "journalctl -u bluetooth -b --no-pager | tail -100:"
+        journalctl -u bluetooth -b --no-pager 2>&1 |
+            tail -n 100 |
+            sed 's/^/[BT-DIAG] /' || true
     else
         log_warn "journalctl not found; cannot dump bluetooth logs"
     fi
+
+    if command -v dmesg >/dev/null 2>&1; then
+        log_warn "Bluetooth-related dmesg tail:"
+        dmesg 2>&1 |
+            grep -Ei "$bt_dmesg_modules" |
+            tail -n 200 |
+            sed 's/^/[BT-DIAG] /' || true
+    else
+        log_warn "dmesg not found; cannot dump kernel Bluetooth logs"
+    fi
+
+    if [ -n "$diag_test_path" ] && command -v scan_dmesg_errors >/dev/null 2>&1; then
+        log_warn "Running scan_dmesg_errors for Bluetooth-related modules"
+        scan_dmesg_errors "$diag_test_path" "$bt_dmesg_modules" "" || true
+    fi
+
+    log_warn "Bluetooth firmware candidates:"
+
+    fw_list="${TMPDIR:-/tmp}/bt_fw_candidates_$$.txt"
+    : > "$fw_list"
+
+    for qca_root in /lib/firmware/qca /usr/lib/firmware/qca; do
+        [ -d "$qca_root" ] || continue
+
+        log_warn "Firmware root: $qca_root"
+
+        if command -v find >/dev/null 2>&1; then
+            find "$qca_root" -maxdepth 2 -type f \
+                \( -name '*btfw*' -o \
+                   -name '*BT*' -o \
+                   -name '*bt*' -o \
+                   -name '*nv*' -o \
+                   -name '*.tlv' -o \
+                   -name '*.bin' -o \
+                   -name '*.mbn' -o \
+                   -name '*.b*' \) \
+                -print 2>/dev/null >> "$fw_list"
+        fi
+    done
+
+    if [ -s "$fw_list" ]; then
+        sort -u "$fw_list" 2>/dev/null |
+        while IFS= read -r fw_file || [ -n "$fw_file" ]; do
+            [ -n "$fw_file" ] || continue
+
+            if command -v print_path_meta >/dev/null 2>&1; then
+                print_path_meta "$fw_file" 2>/dev/null |
+                    sed 's/^/[BT-DIAG] /' || true
+            elif command -v stat >/dev/null 2>&1; then
+                stat -c '%A %U %G %a %n' "$fw_file" 2>/dev/null |
+                    sed 's/^/[BT-DIAG] /' || true
+            else
+                printf '%s\n' "$fw_file" |
+                    sed 's/^/[BT-DIAG] /'
+            fi
+        done
+    else
+        if command -v btfwpresent >/dev/null 2>&1; then
+            fw_dir="$(btfwpresent 2>/dev/null || true)"
+
+            if [ -n "$fw_dir" ]; then
+                log_warn "btfwpresent found Bluetooth firmware under: $fw_dir"
+
+                if command -v find >/dev/null 2>&1; then
+                    find "$fw_dir" -maxdepth 1 -type f -print 2>/dev/null |
+                    while IFS= read -r fw_file || [ -n "$fw_file" ]; do
+                        [ -n "$fw_file" ] || continue
+
+                        if command -v print_path_meta >/dev/null 2>&1; then
+                            print_path_meta "$fw_file" 2>/dev/null |
+                                sed 's/^/[BT-DIAG] /' || true
+                        elif command -v stat >/dev/null 2>&1; then
+                            stat -c '%A %U %G %a %n' "$fw_file" 2>/dev/null |
+                                sed 's/^/[BT-DIAG] /' || true
+                        else
+                            printf '%s\n' "$fw_file" |
+                                sed 's/^/[BT-DIAG] /'
+                        fi
+                    done
+                else
+                    log_warn "find not available; firmware file listing skipped"
+                fi
+            else
+                log_warn "No Bluetooth firmware candidates found by btfwpresent"
+            fi
+        else
+            log_warn "No Bluetooth firmware candidates found under known QCA firmware roots"
+        fi
+    fi
+
+    rm -f "$fw_list" 2>/dev/null || true
 }
 
 # Warn+diag once per run if "bluetoothctl list" is empty in non-interactive mode.
