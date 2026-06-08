@@ -1,0 +1,216 @@
+metadata:
+    format: Lava-Test Test Definition 1.0
+    name: GeneratedPlan
+    description: "Auto-generated test plan from all run.sh files"
+    maintainer:
+        - vnarapar@qti.qualcomm.com
+    os:
+        - openembedded
+    scope:
+        - functional
+    devices:
+        - rb3gen2
+
+run:
+    steps:
+        - cd Runner
+        - $PWD/suites/Connectivity/Bluetooth/BT_FW_KMD_Service/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/Bluetooth/BT_FW_KMD_Service/BT_FW_KMD_Service.res || true
+        - $PWD/suites/Connectivity/Bluetooth/BT_ON_OFF/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/Bluetooth/BT_ON_OFF/BT_ON_OFF.res || true
+        - $PWD/suites/Connectivity/Bluetooth/BT_SCAN/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/Bluetooth/BT_SCAN/BT_SCAN.res || true
+        - $PWD/suites/Connectivity/Bluetooth/BT_SCAN_PAIR/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/Bluetooth/BT_SCAN_PAIR/BT_SCAN_PAIR.res || true
+        - $PWD/suites/Connectivity/Ethernet/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/Ethernet/Ethernet.res || true
+        - $PWD/suites/Connectivity/WiFi/WiFi_Dynamic_IP/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/WiFi/WiFi_Dynamic_IP/WiFi_Dynamic_IP.res || true
+        - $PWD/suites/Connectivity/WiFi/WiFi_Firmware_Driver/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/WiFi/WiFi_Firmware_Driver/WiFi_Firmware_Driver.res || true
+        - $PWD/suites/Connectivity/WiFi/WiFi_Manual_IP/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/WiFi/WiFi_Manual_IP/WiFi_Manual_IP.res || true
+        - $PWD/suites/Connectivity/WiFi/WiFi_OnOff/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/WiFi/WiFi_OnOff/WiFi_OnOff.res || true
+        - $PWD/suites/Kernel/Baseport/BWMON/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/BWMON/BWMON.res || true
+        - $PWD/suites/Kernel/Baseport/Buses/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/Buses/Buses.res || true
+        - $PWD/suites/Kernel/Baseport/CPUFreq_Validation/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/CPUFreq_Validation/CPUFreq_Validation.res || true
+        - $PWD/suites/Kernel/Baseport/GIC/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/GIC/GIC.res || true
+        - $PWD/suites/Kernel/Baseport/IPA/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/IPA/IPA.res || true
+        - $PWD/suites/Kernel/Baseport/IPCC/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/IPCC/IPCC.res || true
+        - $PWD/suites/Kernel/Baseport/Interrupts/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/Interrupts/Interrupts.res || true
+        - $PWD/suites/Kernel/Baseport/Kernel_Selftests/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/Kernel_Selftests/Kernel_Selftests.res || true
+        - $PWD/suites/Kernel/Baseport/MEMLAT/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/MEMLAT/MEMLAT.res || true
+        - $PWD/suites/Kernel/Baseport/Module_Reload_Validation/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/Module_Reload_Validation/Module_Reload_Validation.res || true
+        - $PWD/suites/Kernel/Baseport/PCIe/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/PCIe/PCIe.res || true
+        - $PWD/suites/Kernel/Baseport/Probe_Failure_Check/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/Probe_Failure_Check/Probe_Failure_Check.res || true
+        - $PWD/suites/Kernel/Baseport/RMNET/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/RMNET/RMNET.res || true
+        - $PWD/suites/Kernel/Baseport/Reboot_health_check/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/Reboot_health_check/Reboot_health_check.res || true
+        - $PWD/suites/Kernel/Baseport/Storage/Partition_PostBoot_Validation/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/Storage/Partition_PostBoot_Validation/Partition_PostBoot_Validation.res || true
+        - $PWD/suites/Kernel/Baseport/Storage/UFS_Validation/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/Storage/UFS_Validation/UFS_Validation.res || true
+        - $PWD/suites/Kernel/Baseport/Storage/eMMC_Validation/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/Storage/eMMC_Validation/eMMC_Validation.res || true
+        - $PWD/suites/Kernel/Baseport/Timer/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/Timer/Timer.res || true
+        - $PWD/suites/Kernel/Baseport/USBHost/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/USBHost/USBHost.res || true
+        - $PWD/suites/Kernel/Baseport/UserDataEncryption/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/UserDataEncryption/UserDataEncryption.res || true
+        - $PWD/suites/Kernel/Baseport/adsp_remoteproc/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/adsp_remoteproc/adsp_remoteproc.res || true
+        - $PWD/suites/Kernel/Baseport/cacheflush/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/cacheflush/cacheflush.res || true
+        - $PWD/suites/Kernel/Baseport/cdsp_remoteproc/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/cdsp_remoteproc/cdsp_remoteproc.res || true
+        - $PWD/suites/Kernel/Baseport/dmabuf/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/dmabuf/dmabuf.res || true
+        - $PWD/suites/Kernel/Baseport/dmabuf_heap_kselftest/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/dmabuf_heap_kselftest/dmabuf_heap_kselftest.res || true
+        - $PWD/suites/Kernel/Baseport/etm_trace/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/etm_trace/etm_trace.res || true
+        - $PWD/suites/Kernel/Baseport/gpdsp_remoteproc/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/gpdsp_remoteproc/gpdsp_remoteproc.res || true
+        - $PWD/suites/Kernel/Baseport/hotplug/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/hotplug/hotplug.res || true
+        - $PWD/suites/Kernel/Baseport/hrtimer/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/hrtimer/hrtimer.res || true
+        - $PWD/suites/Kernel/Baseport/iommu/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/iommu/iommu.res || true
+        - $PWD/suites/Kernel/Baseport/ipi/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/ipi/ipi.res || true
+        - $PWD/suites/Kernel/Baseport/irq/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/irq/irq.res || true
+        - $PWD/suites/Kernel/Baseport/kaslr/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/kaslr/kaslr.res || true
+        - $PWD/suites/Kernel/Baseport/pinctrl/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/pinctrl/pinctrl.res || true
+        - $PWD/suites/Kernel/Baseport/qcom_crypto/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/qcom_crypto/qcom_crypto.res || true
+        - $PWD/suites/Kernel/Baseport/qcom_hwrng/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/qcom_hwrng/qcom_hwrng.res || true
+        - $PWD/suites/Kernel/Baseport/qcrypto/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/qcrypto/qcrypto.res || true
+        - $PWD/suites/Kernel/Baseport/remoteproc/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/remoteproc/remoteproc.res || true
+        - $PWD/suites/Kernel/Baseport/rngtest/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/rngtest/rngtest.res || true
+        - $PWD/suites/Kernel/Baseport/shmbridge/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/shmbridge/shmbridge.res || true
+        - $PWD/suites/Kernel/Baseport/smmu/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/smmu/smmu.res || true
+        - $PWD/suites/Kernel/Baseport/spinlock/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/spinlock/spinlock.res || true
+        - $PWD/suites/Kernel/Baseport/stm_cpu/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/stm_cpu/stm_cpu.res || true
+        - $PWD/suites/Kernel/Baseport/usb_hid/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/usb_hid/usb_hid.res || true
+        - $PWD/suites/Kernel/Baseport/watchdog/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/watchdog/watchdog.res || true
+        - $PWD/suites/Kernel/Baseport/watchdog_kselftest/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/watchdog_kselftest/watchdog_kselftest.res || true
+        - $PWD/suites/Kernel/Baseport/watchdog_pretimeout/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/watchdog_pretimeout/watchdog_pretimeout.res || true
+        - $PWD/suites/Kernel/Baseport/wpss_remoteproc/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/wpss_remoteproc/wpss_remoteproc.res || true
+        - $PWD/suites/Kernel/DCVS/Freq_Scaling/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/DCVS/Freq_Scaling/Freq_Scaling.res || true
+        - $PWD/suites/Kernel/Scheduler/CPU_affinity/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Scheduler/CPU_affinity/CPU_affinity.res || true
+        - $PWD/suites/Kernel/Stress/Stress-ng/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Stress/Stress-ng/Stress-ng.res || true
+        - $PWD/suites/Kernel/Stress/Stressapptest/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Stress/Stressapptest/Stressapptest.res || true
+        - $PWD/suites/Multimedia/Audio/AudioPlayback/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Audio/AudioPlayback/AudioPlayback.res || true
+        - $PWD/suites/Multimedia/Audio/AudioRecord/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Audio/AudioRecord/AudioRecord.res || true
+        - $PWD/suites/Multimedia/CDSP/fastrpc_test/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/CDSP/fastrpc_test/fastrpc_test.res || true
+        - $PWD/suites/Multimedia/Camera/Camera_NHX/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Camera/Camera_NHX/Camera_NHX.res || true
+        - $PWD/suites/Multimedia/Camera/Camera_RDI_FrameCapture/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Camera/Camera_RDI_FrameCapture/Camera_RDI_FrameCapture.res || true
+        - $PWD/suites/Multimedia/Camera/Libcamera_cam/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Camera/Libcamera_cam/Libcamera_cam.res || true
+        - $PWD/suites/Multimedia/DSP_AudioPD/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/DSP_AudioPD/DSP_AudioPD.res || true
+        - $PWD/suites/Multimedia/Display/Weston_Runtime_Preflight/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Display/Weston_Runtime_Preflight/Weston_Runtime_Preflight.res || true
+        - $PWD/suites/Multimedia/Display/igt-gpu-tools/core_auth/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Display/igt-gpu-tools/core_auth/core_auth.res || true
+        - $PWD/suites/Multimedia/Display/weston-clickdot/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Display/weston-clickdot/weston-clickdot.res || true
+        - $PWD/suites/Multimedia/Display/weston-cliptest/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Display/weston-cliptest/weston-cliptest.res || true
+        - $PWD/suites/Multimedia/Display/weston-editor/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Display/weston-editor/weston-editor.res || true
+        - $PWD/suites/Multimedia/Display/weston-flower/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Display/weston-flower/weston-flower.res || true
+        - $PWD/suites/Multimedia/Display/weston-resizor/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Display/weston-resizor/weston-resizor.res || true
+        - $PWD/suites/Multimedia/Display/weston-scaler/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Display/weston-scaler/weston-scaler.res || true
+        - $PWD/suites/Multimedia/Display/weston-smoke/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Display/weston-smoke/weston-smoke.res || true
+        - $PWD/suites/Multimedia/GSTreamer/AI_ML/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/GSTreamer/AI_ML/AI_ML.res || true
+        - $PWD/suites/Multimedia/GSTreamer/Audio/Audio_Playback/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/GSTreamer/Audio/Audio_Playback/Audio_Playback.res || true
+        - $PWD/suites/Multimedia/GSTreamer/Audio/Audio_Record_Playback/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/GSTreamer/Audio/Audio_Record_Playback/Audio_Record_Playback.res || true
+        - $PWD/suites/Multimedia/GSTreamer/Camera/Camera_Tests/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/GSTreamer/Camera/Camera_Tests/Camera_Tests.res || true
+        - $PWD/suites/Multimedia/GSTreamer/Display/Waylandsink_Playback/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/GSTreamer/Display/Waylandsink_Playback/Waylandsink_Playback.res || true
+        - $PWD/suites/Multimedia/GSTreamer/Video/Video_Encode_Decode/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/GSTreamer/Video/Video_Encode_Decode/Video_Encode_Decode.res || true
+        - $PWD/suites/Multimedia/Graphics/KMSCube/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Graphics/KMSCube/KMSCube.res || true
+        - $PWD/suites/Multimedia/Graphics/weston-simple-egl/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Graphics/weston-simple-egl/weston-simple-egl.res || true
+        - $PWD/suites/Multimedia/Graphics/weston-simple-shm/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Graphics/weston-simple-shm/weston-simple-shm.res || true
+        - $PWD/suites/Multimedia/OpenCV/run.sh --build-dir . --cwd . --suite all --list 0 --shuffle 0 || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/OpenCV/OpenCV.res || true
+        - $PWD/suites/Multimedia/Sensors/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Sensors/Sensors.res || true
+        - $PWD/suites/Multimedia/Video/Video_V4L2_Runner/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Video/Video_V4L2_Runner/Video_V4L2_Runner.res || true
+        - $PWD/suites/Performance/Boot_Systemd_KPI_Loop/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Performance/Boot_Systemd_KPI_Loop/Boot_Systemd_KPI_Loop.res || true
+        - $PWD/suites/Performance/Boot_Systemd_Validate/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Performance/Boot_Systemd_Validate/Boot_Systemd_Validate.res || true
+        - $PWD/suites/Performance/Geekbench/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Performance/Geekbench/Geekbench.res || true
+        - $PWD/suites/Performance/Sysbench_Performance/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Performance/Sysbench_Performance/Sysbench_Performance.res || true
+        - $PWD/suites/Performance/Tiotest/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Performance/Tiotest/Tiotest.res || true
+        - $PWD/suites/Performance/userspace-resource-manager/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Performance/userspace-resource-manager/userspace-resource-manager.res || true
+        - $PWD/suites/System/Docker_Kernel_Config/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/System/Docker_Kernel_Config/Docker_Kernel_Config.res || true
+        - $PWD/suites/System/EFI_Variable_Validation/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/System/EFI_Variable_Validation/EFI_Variable_Validation.res || true
+        - $PWD/suites/System/Kubernetes_Kernel_Config/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/System/Kubernetes_Kernel_Config/Kubernetes_Kernel_Config.res || true
+        - $PWD/suites/System/Logging/Logging_Journalctl_Validation/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/System/Logging/Logging_Journalctl_Validation/Logging_Journalctl_Validation.res || true
+        - $PWD/utils/result_parse.sh
+
