@@ -31,14 +31,20 @@ if [ -z "${__INIT_ENV_LOADED:-}" ]; then
     __INIT_ENV_LOADED=1
 fi
 
-# shellcheck disable=SC1090
-. "$INIT_ENV"
 # shellcheck disable=SC1091
 . "$TOOLS/functestlib.sh"
 # shellcheck disable=SC1091
 . "$TOOLS/audio_common.sh"
 # shellcheck disable=SC1091
 . "$TOOLS/lib_video.sh"
+
+# audio_prepare_test_packages() in audio_common.sh reuses these helpers.
+# Source the provider only when it was not already loaded by a shared library.
+if ! command -v pkg_detect_os_id >/dev/null 2>&1 &&
+   [ -r "$TOOLS/lib_pkg_provider.sh" ]; then
+  # shellcheck disable=SC1090,SC1091
+  . "$TOOLS/lib_pkg_provider.sh"
+fi
 
 SYSTEMD_AVAILABLE=0
 if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
@@ -48,22 +54,46 @@ fi
 TESTNAME="AudioPlayback"
 RESULT_TESTNAME="$TESTNAME"
 RES_SUFFIX="" # Optional suffix for unique result files (e.g., "Config1")
-# RES_FILE will be set after parsing command-line arguments
+# RES_FILE and LOGDIR are resolved by the early non-consuming pre-parser
 
-# Pre-parse --res-suffix and --lava-testcase-id for early failure handling
-# This ensures unique result files and unique testcase IDs even if setup fails in parallel CI runs
-prev_arg=""
+# Pre-parse the options required by privileged Audio preparation without
+# consuming the original argument list. The normal parser below still receives
+# the complete CLI unchanged.
+AUDIO_OVERLAY_REQUESTED=0
+AUDIO_EARLY_HELP_REQUESTED=0
+AUDIO_EARLY_EXPECT=""
+
 for arg in "$@"; do
-  case "$prev_arg" in
-    --res-suffix)
+  case "$AUDIO_EARLY_EXPECT" in
+    res-suffix)
       RES_SUFFIX="$arg"
+      AUDIO_EARLY_EXPECT=""
+      continue
       ;;
-    --lava-testcase-id)
+    lava-testcase-id)
       RESULT_TESTNAME="$arg"
+      AUDIO_EARLY_EXPECT=""
+      continue
       ;;
   esac
-  prev_arg="$arg"
+
+  case "$arg" in
+    --overlay)
+      AUDIO_OVERLAY_REQUESTED=1
+      ;;
+    --res-suffix)
+      AUDIO_EARLY_EXPECT="res-suffix"
+      ;;
+    --lava-testcase-id)
+      AUDIO_EARLY_EXPECT="lava-testcase-id"
+      ;;
+    --help|-h)
+      AUDIO_EARLY_HELP_REQUESTED=1
+      ;;
+  esac
 done
+
+export AUDIO_OVERLAY_REQUESTED
 
 # ---- Assets ----
 AUDIO_TAR_URL="${AUDIO_TAR_URL:-https://github.com/qualcomm-linux/qcom-linux-testkit/releases/download/AudioClips-v1.1/AudioClips.tar.gz}"
@@ -82,6 +112,11 @@ VERBOSE=0
 EXTRACT_AUDIO_ASSETS="${EXTRACT_AUDIO_ASSETS:-true}"
 ENABLE_NETWORK_DOWNLOAD="${ENABLE_NETWORK_DOWNLOAD:-false}" # Default: no network operations
 AUDIO_CLIPS_BASE_DIR="${AUDIO_CLIPS_BASE_DIR:-}" # Custom path for audio clips (CI use)
+
+# Only the explicit --overlay option enables Debian AudioReach preparation.
+# AUDIO_OVERLAY_REQUESTED was derived above without consuming the CLI.
+AUDIO_PLAYBACK_VOLUME="${AUDIO_PLAYBACK_VOLUME:-1.0}"
+export AUDIO_OVERLAY_REQUESTED AUDIO_PLAYBACK_VOLUME
 
 AUDIO_BOOTSTRAP_MODE="${AUDIO_BOOTSTRAP_MODE:-auto}"
 AUDIO_RUNTIME_DIR="${AUDIO_RUNTIME_DIR:-}"
@@ -109,10 +144,14 @@ SSID=""
 PASSWORD=""
 
 usage() {
-  cat <<EOF
+  cat <<EOF_USAGE
 Usage: $0 [options]
   --backend {pipewire|pulseaudio}
   --sink {speakers|null}
+  --overlay
+      On Debian, ensure the Qualcomm AudioReach package set and prepare the
+      PipeWire runtime before playback. Without this flag, use the native/base
+      audio stack. qcom-distro/Yocto remains unchanged.
   --formats "wav" # Legacy matrix mode only
   --durations "short|short medium" # Legacy matrix mode only (not recommended for new tests)
   --clip-name "play_48KHz_16b_2ch" # Test specific clip(s) by name (space-separated)
@@ -134,6 +173,11 @@ Usage: $0 [options]
   --verbose
   --help
 
+Environment:
+  AUDIO_PLAYBACK_VOLUME
+      PipeWire speaker volume applied to the dynamically discovered sink.
+      Default: 1.0. Null sinks are not unmuted or assigned a volume.
+
 Testing Modes:
   Clip Discovery Mode (Recommended):
     - Auto-discovers clips from AudioClips directory
@@ -149,11 +193,122 @@ Testing Modes:
     - Maintained for backward compatibility
     - Example:
         $0 --formats "wav" --durations "short medium"
-EOF
+EOF_USAGE
 }
+
+# Keep Debian service recovery inside the prepared user manager. Preserve the
+# existing broad best-effort recovery only for native/Yocto execution.
+audio_playback_restart_backend_best_effort() {
+  aprbbe_backend="$1"
+
+  if [ "$AUDIO_PLAYBACK_DEBIAN_ROOT_MODE" -ne 1 ]; then
+    audio_restart_services_best_effort
+    return $?
+  fi
+
+  case "$aprbbe_backend" in
+    pipewire)
+      audio_restart_pipewire_service "1/1"
+      ;;
+    pulseaudio)
+      audio_run_as_test_user \
+        --require-session \
+        systemctl --user restart pulseaudio
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# On Debian, manual daemon bootstrap is replaced by one user-service recovery
+# attempt. Native and minimal Yocto images retain their existing bootstrap path.
+audio_playback_bootstrap_backend_if_needed() {
+  if [ "$AUDIO_PLAYBACK_DEBIAN_ROOT_MODE" -ne 1 ]; then
+    audio_bootstrap_backend_if_needed
+    return $?
+  fi
+
+  case "${AUDIO_BACKEND:-pipewire}" in
+    pipewire|'')
+      audio_restart_pipewire_service "1/1"
+      ;;
+    pulseaudio)
+      audio_run_as_test_user \
+        --require-session \
+        systemctl --user restart pulseaudio
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+# --help must not install packages, change user groups, create output files, or
+# start a systemd user manager.
+if [ "$AUDIO_EARLY_HELP_REQUESTED" -eq 1 ]; then
+  usage
+  exit 0
+fi
+
+# Resolve root-owned result and log paths before privileged preparation.
+if [ -n "$RES_SUFFIX" ]; then
+  RES_FILE="$SCRIPT_DIR/${TESTNAME}_${RES_SUFFIX}.res"
+  LOGDIR="$SCRIPT_DIR/results/${TESTNAME}_${RES_SUFFIX}"
+  log_info "Using unique result file: $RES_FILE"
+  log_info "Using unique log directory: $LOGDIR"
+else
+  RES_FILE="$SCRIPT_DIR/${TESTNAME}.res"
+  LOGDIR="$SCRIPT_DIR/results/${TESTNAME}"
+fi
+
+# Package and udev preparation remain privileged and run exactly once. The
+# complete runner remains the root orchestrator on Debian.
+if ! command -v audio_prepare_test_packages >/dev/null 2>&1; then
+  log_fail "$TESTNAME FAIL - required helper is unavailable: audio_prepare_test_packages"
+  echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+  exit 1
+fi
+
+audio_prepare_test_packages \
+  "$AUDIO_OVERLAY_REQUESTED"
+audio_prepare_rc=$?
+
+case "$audio_prepare_rc" in
+  0)
+    ;;
+  2)
+    log_skip "$TESTNAME SKIP - AudioReach kernel package changed; reboot required"
+    echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
+    exit 0
+    ;;
+  *)
+    log_fail "$TESTNAME FAIL - audio package preparation failed"
+    echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+    exit 1
+    ;;
+esac
+
+# Root owns orchestration outputs and downloaded assets.
+if ! mkdir -p "$LOGDIR"; then
+  log_fail "$TESTNAME FAIL - failed to create log directory: $LOGDIR"
+  echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+  exit 1
+fi
+
+if ! : >"$LOGDIR/summary.txt"; then
+  log_fail "$TESTNAME FAIL - failed to initialize summary file: $LOGDIR/summary.txt"
+  echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+  exit 1
+fi
 
 while [ $# -gt 0 ]; do
   case "$1" in
+    --overlay)
+      AUDIO_OVERLAY_REQUESTED=1
+      export AUDIO_OVERLAY_REQUESTED
+      shift
+      ;;
     --backend)
       AUDIO_BACKEND="$2"
       shift 2
@@ -261,42 +416,87 @@ while [ $# -gt 0 ]; do
   esac
 done
 
+# Prepare only the Debian user capabilities required by the selected mode.
+# Explicit base ALSA playback needs group membership but no systemd user
+# manager. Overlay and managed backends require the user session.
+AUDIO_PLAYBACK_USER_MANAGER_REQUIRED=1
+if [ "$AUDIO_OVERLAY_REQUESTED" -eq 0 ] &&
+   [ "$AUDIO_BACKEND" = "alsa" ]; then
+  AUDIO_PLAYBACK_USER_MANAGER_REQUIRED=0
+fi
+
+if ! command -v audio_prepare_debian_audio_environment >/dev/null 2>&1; then
+  log_fail "$TESTNAME FAIL - required helper is unavailable: audio_prepare_debian_audio_environment"
+  echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+  exit 1
+fi
+
+if ! audio_prepare_debian_audio_environment \
+    "$AUDIO_PLAYBACK_USER_MANAGER_REQUIRED"; then
+  log_fail "$TESTNAME FAIL - Debian Audio environment preparation failed"
+  echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+  exit 1
+fi
+
+AUDIO_PLAYBACK_DEBIAN_ROOT_MODE=0
+if command -v pkg_detect_os_id >/dev/null 2>&1; then
+  AUDIO_PLAYBACK_OS_ID="$(pkg_detect_os_id 2>/dev/null || echo unknown)"
+else
+  AUDIO_PLAYBACK_OS_ID="$(
+    sed -n 's/^ID=//p' /etc/os-release 2>/dev/null |
+      sed -n '1p' |
+      sed 's/^"//;s/"$//' |
+      tr '[:upper:]' '[:lower:]'
+  )"
+fi
+
+if [ "$AUDIO_PLAYBACK_OS_ID" = "debian" ]; then
+  AUDIO_PLAYBACK_DEBIAN_ROOT_MODE=1
+fi
+
+export AUDIO_PLAYBACK_DEBIAN_ROOT_MODE
+
 # Auto-enable network download if WiFi credentials provided
 if [ -n "$SSID" ] && [ -n "$PASSWORD" ]; then
   log_info "WiFi credentials provided, auto-enabling network download"
   ENABLE_NETWORK_DOWNLOAD=true
 fi
 
-# Generate result file path with optional suffix (after parsing CLI args)
-# Use absolute path anchored to SCRIPT_DIR for consistency
-if [ -n "$RES_SUFFIX" ]; then
-  RES_FILE="$SCRIPT_DIR/${TESTNAME}_${RES_SUFFIX}.res"
-  log_info "Using unique result file: $RES_FILE"
-else
-  RES_FILE="$SCRIPT_DIR/${TESTNAME}.res"
-fi
+# Debian overlay runtime preparation runs from the root orchestrator after
+# normal CLI parsing. Only its device and PipeWire probes execute as debian.
+if [ "$AUDIO_OVERLAY_REQUESTED" -eq 1 ]; then
+  if ! command -v audio_prepare_overlay_runtime >/dev/null 2>&1; then
+    log_fail "$TESTNAME FAIL - required helper is unavailable: audio_prepare_overlay_runtime"
+    echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+    exit 1
+  fi
 
-# Initialize LOGDIR after parsing CLI args (to apply RES_SUFFIX correctly)
-# Use absolute paths for LOGDIR to work from any directory
-# Apply suffix for unique log directories per invocation (matches RES_FILE behavior)
-LOGDIR="$SCRIPT_DIR/results/${TESTNAME}"
-if [ -n "$RES_SUFFIX" ]; then
-  LOGDIR="${LOGDIR}_${RES_SUFFIX}"
-  log_info "Using unique log directory: $LOGDIR"
-fi
-mkdir -p "$LOGDIR"
+  audio_prepare_overlay_runtime "$AUDIO_OVERLAY_REQUESTED"
+  audio_runtime_rc=$?
 
-# Initialize summary file to prevent accumulation from previous test runs
-: > "$LOGDIR/summary.txt"
-
-# ------------- Mode Detection and Validation -------------
-
-if [ "$SYSTEMD_AVAILABLE" -eq 1 ]; then
+  case "$audio_runtime_rc" in
+    0)
+      ;;
+    2)
+      log_skip "$TESTNAME SKIP - AudioReach kernel package changed; reboot required"
+      echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
+      exit 0
+      ;;
+    *)
+      log_fail "$TESTNAME FAIL - AudioReach runtime preparation failed"
+      echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+      exit 1
+      ;;
+  esac
+elif [ "$SYSTEMD_AVAILABLE" -eq 1 ] &&
+     [ "$AUDIO_PLAYBACK_DEBIAN_ROOT_MODE" -ne 1 ]; then
+  # Preserve the existing native/Yocto validation path. Debian base mode uses
+  # command-level user probes during backend discovery instead.
   if ! setup_overlay_audio_environment; then
-    log_warn "Overlay audio environment setup failed; continuing with backend recovery flow"
+    log_warn "Existing overlay audio environment validation failed; continuing with backend recovery flow"
   fi
 else
-  log_info "systemd not available; skipping overlay audio environment setup (minimal ramdisk mode)"
+  log_info "systemd not available; skipping legacy overlay environment check"
 fi
 
 if [ "$SYSTEMD_AVAILABLE" -eq 0 ]; then
@@ -394,7 +594,7 @@ if [ -n "$AUDIO_CLIPS_BASE_DIR" ]; then
   log_info "Using custom audio clips path: $AUDIO_CLIPS_BASE_DIR"
 fi
 
-log_info "Args: backend=${AUDIO_BACKEND:-auto} sink=$SINK_CHOICE loops=$LOOPS timeout=$TIMEOUT formats='$FORMATS' durations='$DURATIONS' strict=$STRICT dmesg=$DMESG_SCAN extract=$EXTRACT_AUDIO_ASSETS network_download=$ENABLE_NETWORK_DOWNLOAD clips_path=${AUDIO_CLIPS_BASE_DIR:-default} bootstrap=$AUDIO_BOOTSTRAP_MODE runtime_dir=${AUDIO_RUNTIME_DIR:-auto}"
+log_info "Args: backend=${AUDIO_BACKEND:-auto} sink=$SINK_CHOICE overlay=$AUDIO_OVERLAY_REQUESTED volume=$AUDIO_PLAYBACK_VOLUME loops=$LOOPS timeout=$TIMEOUT formats='$FORMATS' durations='$DURATIONS' strict=$STRICT dmesg=$DMESG_SCAN extract=$EXTRACT_AUDIO_ASSETS network_download=$ENABLE_NETWORK_DOWNLOAD clips_path=${AUDIO_CLIPS_BASE_DIR:-default} bootstrap=$AUDIO_BOOTSTRAP_MODE runtime_dir=${AUDIO_RUNTIME_DIR:-auto}"
 
 # --- Rootfs minimum size check (mirror video policy) ---
 if [ "$TOP_LEVEL_RUN" -eq 1 ]; then
@@ -468,7 +668,7 @@ fi
 
 # Resolve backend
 if [ -z "$AUDIO_BACKEND" ]; then
-  AUDIO_BACKEND="$(detect_audio_backend 2>/dev/null || echo "")"
+  AUDIO_BACKEND="$(audio_run_helper_as_test_user --require-session detect_audio_backend 2>/dev/null || echo "")"
 fi
 
 AUDIO_SYSTEMD_MANAGED=0
@@ -480,15 +680,15 @@ fi
 export AUDIO_SYSTEMD_MANAGED
 
 if [ -z "$AUDIO_BACKEND" ]; then
-  if audio_playback_alsa_probe; then
+  if audio_run_helper_as_test_user audio_playback_alsa_probe; then
     AUDIO_BACKEND="alsa"
     AUDIO_SYSTEMD_MANAGED=0
     export AUDIO_SYSTEMD_MANAGED
     log_info "Using backend: alsa (direct minimal-build fallback)"
-  elif audio_bootstrap_backend_if_needed; then
-    AUDIO_BACKEND="$(detect_audio_backend 2>/dev/null || echo "")"
+  elif audio_playback_bootstrap_backend_if_needed; then
+    AUDIO_BACKEND="$(audio_run_helper_as_test_user --require-session detect_audio_backend 2>/dev/null || echo "")"
     if [ -z "$AUDIO_BACKEND" ]; then
-      if audio_playback_alsa_probe; then
+      if audio_run_helper_as_test_user audio_playback_alsa_probe; then
         AUDIO_BACKEND="alsa"
         AUDIO_SYSTEMD_MANAGED=0
         export AUDIO_SYSTEMD_MANAGED
@@ -510,14 +710,14 @@ log_info "Using backend: $AUDIO_BACKEND"
 
 backend_ok=0
 if [ "$AUDIO_BACKEND" = "alsa" ]; then
-  if audio_playback_alsa_probe; then
+  if audio_run_helper_as_test_user audio_playback_alsa_probe; then
     backend_ok=1
   fi
 else
-  if audio_backend_ready "$AUDIO_BACKEND"; then
+  if audio_run_helper_as_test_user --require-session audio_backend_ready "$AUDIO_BACKEND"; then
     backend_ok=1
   else
-    if check_audio_daemon "$AUDIO_BACKEND"; then
+    if audio_run_helper_as_test_user --require-session check_audio_daemon "$AUDIO_BACKEND"; then
       backend_ok=1
     fi
   fi
@@ -526,12 +726,12 @@ fi
 if [ "$backend_ok" -ne 1 ]; then
   if [ "$SYSTEMD_AVAILABLE" -eq 1 ] && [ "${AUDIO_SYSTEMD_MANAGED:-0}" -eq 1 ]; then
     log_warn "$TESTNAME: backend not available ($AUDIO_BACKEND) - attempting restart+retry once"
-    audio_restart_services_best_effort >/dev/null 2>&1 || true
-    audio_wait_audio_ready 20 >/dev/null 2>&1 || true
-    if audio_backend_ready "$AUDIO_BACKEND"; then
+    audio_playback_restart_backend_best_effort "$AUDIO_BACKEND" >/dev/null 2>&1 || true
+    audio_run_helper_as_test_user --require-session audio_wait_audio_ready 20 "$AUDIO_BACKEND" >/dev/null 2>&1 || true
+    if audio_run_helper_as_test_user --require-session audio_backend_ready "$AUDIO_BACKEND"; then
       backend_ok=1
     else
-      if check_audio_daemon "$AUDIO_BACKEND"; then
+      if audio_run_helper_as_test_user --require-session check_audio_daemon "$AUDIO_BACKEND"; then
         backend_ok=1
       fi
     fi
@@ -539,14 +739,22 @@ if [ "$backend_ok" -ne 1 ]; then
 fi
 
 if [ "$backend_ok" -ne 1 ] && [ "$AUDIO_BACKEND" != "alsa" ]; then
-  log_warn "$TESTNAME: backend not available ($AUDIO_BACKEND) - attempting manual bootstrap"
-  if audio_bootstrap_backend_if_needed; then
-    AUDIO_SYSTEMD_MANAGED=0
+  if [ "$AUDIO_PLAYBACK_DEBIAN_ROOT_MODE" -eq 1 ]; then
+    log_warn "$TESTNAME: backend not available ($AUDIO_BACKEND) - attempting user-service recovery"
+  else
+    log_warn "$TESTNAME: backend not available ($AUDIO_BACKEND) - attempting manual bootstrap"
+  fi
+  if audio_playback_bootstrap_backend_if_needed; then
+    if [ "$AUDIO_PLAYBACK_DEBIAN_ROOT_MODE" -eq 1 ]; then
+      AUDIO_SYSTEMD_MANAGED=1
+    else
+      AUDIO_SYSTEMD_MANAGED=0
+    fi
     export AUDIO_SYSTEMD_MANAGED
-    if audio_backend_ready "$AUDIO_BACKEND"; then
+    if audio_run_helper_as_test_user --require-session audio_backend_ready "$AUDIO_BACKEND"; then
       backend_ok=1
     else
-      if check_audio_daemon "$AUDIO_BACKEND"; then
+      if audio_run_helper_as_test_user --require-session check_audio_daemon "$AUDIO_BACKEND"; then
         backend_ok=1
       fi
     fi
@@ -554,7 +762,7 @@ if [ "$backend_ok" -ne 1 ] && [ "$AUDIO_BACKEND" != "alsa" ]; then
 fi
 
 if [ "$backend_ok" -ne 1 ] && [ "$AUDIO_BACKEND" != "alsa" ]; then
-  if audio_playback_alsa_probe; then
+  if audio_run_helper_as_test_user audio_playback_alsa_probe; then
     log_warn "$TESTNAME: falling back to ALSA direct playback path"
     AUDIO_BACKEND="alsa"
     AUDIO_SYSTEMD_MANAGED=0
@@ -573,7 +781,7 @@ fi
 case "$AUDIO_BACKEND" in
   pipewire)
     if ! check_dependencies pw-play; then
-      if audio_playback_alsa_probe && check_dependencies aplay; then
+      if audio_run_helper_as_test_user audio_playback_alsa_probe && check_dependencies aplay; then
         log_warn "$TESTNAME: PipeWire playback utility missing - falling back to ALSA"
         AUDIO_BACKEND="alsa"
         AUDIO_SYSTEMD_MANAGED=0
@@ -587,7 +795,7 @@ case "$AUDIO_BACKEND" in
     ;;
   pulseaudio)
     if ! check_dependencies paplay; then
-      if audio_playback_alsa_probe && check_dependencies aplay; then
+      if audio_run_helper_as_test_user audio_playback_alsa_probe && check_dependencies aplay; then
         log_warn "$TESTNAME: PulseAudio playback utility missing - falling back to ALSA"
         AUDIO_BACKEND="alsa"
         AUDIO_SYSTEMD_MANAGED=0
@@ -614,17 +822,17 @@ case "$AUDIO_BACKEND" in
 esac
 
 if [ "$AUDIO_BACKEND" = "pipewire" ]; then
-  if ! audio_pw_ctl_ok 2>/dev/null; then
+  if ! audio_run_helper_as_test_user --require-session audio_pw_ctl_ok 2>/dev/null; then
     if [ "$SYSTEMD_AVAILABLE" -eq 1 ] && [ "${AUDIO_SYSTEMD_MANAGED:-0}" -eq 1 ]; then
       log_warn "$TESTNAME: wpctl not responsive - attempting restart+retry once"
-      audio_restart_services_best_effort >/dev/null 2>&1 || true
-      audio_wait_audio_ready 20 >/dev/null 2>&1 || true
+      audio_playback_restart_backend_best_effort "$AUDIO_BACKEND" >/dev/null 2>&1 || true
+      audio_run_helper_as_test_user --require-session audio_wait_audio_ready 20 "$AUDIO_BACKEND" >/dev/null 2>&1 || true
     else
       log_warn "$TESTNAME: PipeWire control-plane not responsive - attempting ALSA fallback"
     fi
 
-    if ! audio_pw_ctl_ok 2>/dev/null; then
-      if audio_playback_alsa_probe && check_dependencies aplay; then
+    if ! audio_run_helper_as_test_user --require-session audio_pw_ctl_ok 2>/dev/null; then
+      if audio_run_helper_as_test_user audio_playback_alsa_probe && check_dependencies aplay; then
         log_warn "$TESTNAME: falling back to ALSA direct playback path"
         AUDIO_BACKEND="alsa"
         AUDIO_SYSTEMD_MANAGED=0
@@ -637,17 +845,17 @@ if [ "$AUDIO_BACKEND" = "pipewire" ]; then
     fi
   fi
 elif [ "$AUDIO_BACKEND" = "pulseaudio" ]; then
-  if ! audio_pa_ctl_ok 2>/dev/null; then
+  if ! audio_run_helper_as_test_user --require-session audio_pa_ctl_ok 2>/dev/null; then
     if [ "$SYSTEMD_AVAILABLE" -eq 1 ] && [ "${AUDIO_SYSTEMD_MANAGED:-0}" -eq 1 ]; then
       log_warn "$TESTNAME: pactl not responsive - attempting restart+retry once"
-      audio_restart_services_best_effort >/dev/null 2>&1 || true
-      audio_wait_audio_ready 20 >/dev/null 2>&1 || true
+      audio_playback_restart_backend_best_effort "$AUDIO_BACKEND" >/dev/null 2>&1 || true
+      audio_run_helper_as_test_user --require-session audio_wait_audio_ready 20 "$AUDIO_BACKEND" >/dev/null 2>&1 || true
     else
       log_warn "$TESTNAME: PulseAudio control-plane not responsive - attempting ALSA fallback"
     fi
 
-    if ! audio_pa_ctl_ok 2>/dev/null; then
-      if audio_playback_alsa_probe && check_dependencies aplay; then
+    if ! audio_run_helper_as_test_user --require-session audio_pa_ctl_ok 2>/dev/null; then
+      if audio_run_helper_as_test_user audio_playback_alsa_probe && check_dependencies aplay; then
         log_warn "$TESTNAME: falling back to ALSA direct playback path"
         AUDIO_BACKEND="alsa"
         AUDIO_SYSTEMD_MANAGED=0
@@ -665,16 +873,16 @@ fi
 SINK_ID=""
 case "$AUDIO_BACKEND:$SINK_CHOICE" in
   pipewire:null)
-    SINK_ID="$(pw_default_null)"
+    SINK_ID="$(audio_run_helper_as_test_user --require-session pw_default_null)"
     ;;
   pipewire:*)
-    SINK_ID="$(pw_default_speakers)"
+    SINK_ID="$(audio_run_helper_as_test_user --require-session pw_default_speakers)"
     ;;
   pulseaudio:null)
-    SINK_ID="$(pa_default_null)"
+    SINK_ID="$(audio_run_helper_as_test_user --require-session pa_default_null)"
     ;;
   pulseaudio:*)
-    SINK_ID="$(pa_default_speakers)"
+    SINK_ID="$(audio_run_helper_as_test_user --require-session pa_default_speakers)"
     ;;
   alsa:null)
     SINK_ID="null"
@@ -696,18 +904,32 @@ if [ -z "$SINK_ID" ]; then
 fi
 
 if [ "$AUDIO_BACKEND" = "pipewire" ]; then
-  SINK_NAME="$(pw_sink_name_safe "$SINK_ID")"
-  wpctl set-default "$SINK_ID" >/dev/null 2>&1 || true
+  SINK_NAME="$(audio_run_helper_as_test_user --require-session pw_sink_name_safe "$SINK_ID")"
+  audio_run_helper_as_test_user --require-session pw_set_default_sink "$SINK_ID" >/dev/null 2>&1 ||
+    log_warn "Could not set PipeWire default sink id=$SINK_ID"
+
+  # Apply speaker volume to the discovered sink only. Null sinks remain
+  # untouched because volume/mute state is irrelevant to null playback.
+  if [ "$SINK_CHOICE" != "null" ]; then
+    audio_run_with_timeout_as_test_user --require-session 3s \
+      wpctl set-mute "$SINK_ID" 0 >/dev/null 2>&1 ||
+      log_warn "Could not unmute PipeWire sink id=$SINK_ID"
+
+    audio_run_with_timeout_as_test_user --require-session 3s \
+      wpctl set-volume "$SINK_ID" "$AUDIO_PLAYBACK_VOLUME" >/dev/null 2>&1 ||
+      log_warn "Could not set PipeWire sink volume id=$SINK_ID volume=$AUDIO_PLAYBACK_VOLUME"
+  fi
+
   if [ -z "$SINK_NAME" ]; then
     SINK_NAME="unknown"
   fi
   log_info "Routing to sink: id=$SINK_ID name='$SINK_NAME' choice=$SINK_CHOICE"
 elif [ "$AUDIO_BACKEND" = "pulseaudio" ]; then
-  SINK_NAME="$(pa_sink_name "$SINK_ID")"
+  SINK_NAME="$(audio_run_helper_as_test_user --require-session pa_sink_name "$SINK_ID")"
   if [ -z "$SINK_NAME" ]; then
     SINK_NAME="$SINK_ID"
   fi
-  pa_set_default_sink "$SINK_ID" >/dev/null 2>&1 || true
+  audio_run_helper_as_test_user --require-session pa_set_default_sink "$SINK_ID" >/dev/null 2>&1 || true
   log_info "Routing to sink: name='$SINK_NAME' choice=$SINK_CHOICE"
 else
   SINK_NAME="$SINK_ID"
@@ -722,7 +944,7 @@ fi
 
 min_ok=0
 if [ "$dur_s" -gt 0 ] 2>/dev/null; then
-  min_ok=$($dur_s - 1)
+  min_ok=$((dur_s - 1))
   if [ "$min_ok" -lt 1 ]; then
     min_ok=1
   fi
@@ -839,15 +1061,15 @@ if [ "$USE_CLIP_DISCOVERY" = "true" ]; then
 
       if [ "$AUDIO_BACKEND" = "pipewire" ]; then
         log_info "[$case_name] exec: pw-play -v \"$clip_path\""
-        audio_exec_with_timeout "$effective_timeout" pw-play -v "$clip_path" >>"$logf" 2>&1
+        audio_run_with_timeout_as_test_user --require-session "$effective_timeout" pw-play -v "$clip_path" >>"$logf" 2>&1
         rc=$?
       elif [ "$AUDIO_BACKEND" = "pulseaudio" ]; then
         log_info "[$case_name] exec: paplay --device=\"$SINK_NAME\" \"$clip_path\""
-        audio_exec_with_timeout "$effective_timeout" paplay --device="$SINK_NAME" "$clip_path" >>"$logf" 2>&1
+        audio_run_with_timeout_as_test_user --require-session "$effective_timeout" paplay --device="$SINK_NAME" "$clip_path" >>"$logf" 2>&1
         rc=$?
       else
         log_info "[$case_name] exec: aplay -D \"$SINK_NAME\" \"$clip_path\""
-        audio_exec_with_timeout "$effective_timeout" aplay -D "$SINK_NAME" "$clip_path" >>"$logf" 2>&1
+        audio_run_with_timeout_as_test_user "$effective_timeout" aplay -D "$SINK_NAME" "$clip_path" >>"$logf" 2>&1
         rc=$?
       fi
 
@@ -858,8 +1080,8 @@ if [ "$USE_CLIP_DISCOVERY" = "true" ]; then
       fi
 
       # Evidence collection
-      pw_ev="$(audio_evidence_pw_streaming || echo 0)"
-      pa_ev="$(audio_evidence_pa_streaming || echo 0)"
+      pw_ev="$(audio_run_helper_as_test_user --require-session audio_evidence_pw_streaming || echo 0)"
+      pa_ev="$(audio_run_helper_as_test_user --require-session audio_evidence_pa_streaming || echo 0)"
 
       # Minimal PulseAudio fallback
       if [ "$AUDIO_BACKEND" = "pulseaudio" ] && [ "$pa_ev" -eq 0 ]; then
@@ -870,7 +1092,7 @@ if [ "$USE_CLIP_DISCOVERY" = "true" ]; then
 
       alsa_ev="$(audio_evidence_alsa_running_any || echo 0)"
       asoc_ev="$(audio_evidence_asoc_path_on || echo 0)"
-      pwlog_ev="$(audio_evidence_pw_log_seen || echo 0)"
+      pwlog_ev="$(audio_run_helper_as_test_user --require-session audio_evidence_pw_log_seen || echo 0)"
       if [ "$AUDIO_BACKEND" = "pulseaudio" ] || [ "$AUDIO_BACKEND" = "alsa" ]; then
         pwlog_ev=0
       fi
@@ -894,13 +1116,13 @@ if [ "$USE_CLIP_DISCOVERY" = "true" ]; then
       # Determine result (use clip-specific timeout thresholds)
       if [ "$rc" -eq 0 ]; then
         log_pass "[$case_name] loop $i OK (rc=0, ${last_elapsed}s)"
-	ok_runs=$((ok_runs + 1))
+        ok_runs=$((ok_runs + 1))
       elif [ "$rc" -eq 124 ] && [ "$clip_dur_s" -gt 0 ] 2>/dev/null && [ "$last_elapsed" -ge "$clip_min_ok" ]; then
         log_warn "[$case_name] TIMEOUT ($TIMEOUT) - PASS (ran ~${last_elapsed}s, expected ${clip_duration}s)"
-	ok_runs=$((ok_runs + 1))
+        ok_runs=$((ok_runs + 1))
       elif [ "$rc" -ne 0 ] && { [ "$pw_ev" -eq 1 ] || [ "$pa_ev" -eq 1 ] || [ "$alsa_ev" -eq 1 ] || [ "$asoc_ev" -eq 1 ]; }; then
         log_warn "[$case_name] nonzero rc=$rc but evidence indicates playback - PASS"
-	ok_runs=$((ok_runs + 1))
+        ok_runs=$((ok_runs + 1))
       else
         log_fail "[$case_name] loop $i FAILED (rc=$rc, ${last_elapsed}s) - see $logf"
       fi
@@ -934,7 +1156,7 @@ else
       if [ -z "$clip" ]; then
         log_warn "[$case_name] No clip mapping for format=$fmt duration=$dur"
         echo "$case_name SKIP (no clip mapping)" >> "$LOGDIR/summary.txt"
-	skip=$((skip + 1)) 
+        skip=$((skip + 1))
         continue
       fi
 
@@ -952,7 +1174,7 @@ else
             log_info "[$case_name] Hint: Run with --enable-network-download to download clips"
           fi
           echo "$case_name SKIP (clip unavailable)" >> "$LOGDIR/summary.txt"
-	  skip=$((skip + 1))
+          skip=$((skip + 1))
           continue
         fi
       fi
@@ -976,27 +1198,27 @@ else
 
         if [ "$AUDIO_BACKEND" = "pipewire" ]; then
           log_info "[$case_name] exec: pw-play -v \"$clip\""
-          audio_exec_with_timeout "$TIMEOUT" pw-play -v "$clip" >>"$logf" 2>&1
+          audio_run_with_timeout_as_test_user --require-session "$TIMEOUT" pw-play -v "$clip" >>"$logf" 2>&1
           rc=$?
         elif [ "$AUDIO_BACKEND" = "pulseaudio" ]; then
           log_info "[$case_name] exec: paplay --device=\"$SINK_NAME\" \"$clip\""
-          audio_exec_with_timeout "$TIMEOUT" paplay --device="$SINK_NAME" "$clip" >>"$logf" 2>&1
+          audio_run_with_timeout_as_test_user --require-session "$TIMEOUT" paplay --device="$SINK_NAME" "$clip" >>"$logf" 2>&1
           rc=$?
         else
           log_info "[$case_name] exec: aplay -D \"$SINK_NAME\" \"$clip\""
-          audio_exec_with_timeout "$TIMEOUT" aplay -D "$SINK_NAME" "$clip" >>"$logf" 2>&1
+          audio_run_with_timeout_as_test_user "$TIMEOUT" aplay -D "$SINK_NAME" "$clip" >>"$logf" 2>&1
           rc=$?
         fi
 
         end_s="$(date +%s 2>/dev/null || echo 0)"
-	last_elapsed=$((end_s - start_s))
+        last_elapsed=$((end_s - start_s))
         if [ "$last_elapsed" -lt 0 ]; then
           last_elapsed=0
         fi
 
         # Evidence
-        pw_ev="$(audio_evidence_pw_streaming || echo 0)"
-        pa_ev="$(audio_evidence_pa_streaming || echo 0)"
+        pw_ev="$(audio_run_helper_as_test_user --require-session audio_evidence_pw_streaming || echo 0)"
+        pa_ev="$(audio_run_helper_as_test_user --require-session audio_evidence_pa_streaming || echo 0)"
 
         # Minimal PulseAudio fallback so pa_streaming doesn't read as 0 after teardown
         if [ "$AUDIO_BACKEND" = "pulseaudio" ] && [ "$pa_ev" -eq 0 ]; then
@@ -1007,7 +1229,7 @@ else
 
         alsa_ev="$(audio_evidence_alsa_running_any || echo 0)"
         asoc_ev="$(audio_evidence_asoc_path_on || echo 0)"
-        pwlog_ev="$(audio_evidence_pw_log_seen || echo 0)"
+        pwlog_ev="$(audio_run_helper_as_test_user --require-session audio_evidence_pw_log_seen || echo 0)"
         if [ "$AUDIO_BACKEND" = "pulseaudio" ] || [ "$AUDIO_BACKEND" = "alsa" ]; then
           pwlog_ev=0
         fi
@@ -1030,25 +1252,25 @@ else
 
         if [ "$rc" -eq 0 ]; then
           log_pass "[$case_name] loop $i OK (rc=0, ${last_elapsed}s)"
-	  ok_runs=$((ok_runs + 1))
+          ok_runs=$((ok_runs + 1))
         elif [ "$rc" -eq 124 ] && [ "$dur_s" -gt 0 ] 2>/dev/null && [ "$last_elapsed" -ge "$min_ok" ]; then
           log_warn "[$case_name] TIMEOUT ($TIMEOUT) - PASS (ran ~${last_elapsed}s)"
-	  ok_runs=$((ok_runs + 1))
+          ok_runs=$((ok_runs + 1))
         elif [ "$rc" -ne 0 ] && { [ "$pw_ev" -eq 1 ] || [ "$pa_ev" -eq 1 ] || [ "$alsa_ev" -eq 1 ] || [ "$asoc_ev" -eq 1 ]; }; then
           log_warn "[$case_name] nonzero rc=$rc but evidence indicates playback - PASS"
-	  ok_runs=$((ok_runs + 1))
+          ok_runs=$((ok_runs + 1))
         else
           log_fail "[$case_name] loop $i FAILED (rc=$rc, ${last_elapsed}s) - see $logf"
         fi
 
-	i=$((i + 1))
+        i=$((i + 1))
       done
 
       if [ "$ok_runs" -ge 1 ]; then
-	pass=$((pass + 1))
+        pass=$((pass + 1))
         echo "$case_name PASS" >> "$LOGDIR/summary.txt"
       else
-	fail=$((fail + 1))
+        fail=$((fail + 1))
         echo "$case_name FAIL" >> "$LOGDIR/summary.txt"
         suite_rc=1
       fi
