@@ -6,6 +6,7 @@
 # - validates ALSA sound card registration
 # - validates /dev/snd/controlC<N> nodes
 # - optionally validates PCM/playback/capture entries
+# - optionally prepares Debian AudioReach packages with --overlay
 # - does not start/restart PipeWire, PulseAudio, ADSP, or remoteproc
 # - does not play or record audio
 
@@ -41,7 +42,17 @@ fi
 # shellcheck disable=SC1091
 . "$TOOLS/audio_common.sh"
 
+if [ -r "$TOOLS/lib_pkg_provider.sh" ]; then
+    # shellcheck disable=SC1090,SC1091
+    . "$TOOLS/lib_pkg_provider.sh"
+fi
+
 TESTNAME="Audio_Card_Registration"
+
+# Only the explicit --overlay option enables Debian AudioReach preparation.
+# Ignore inherited values so native/base mode remains the default.
+AUDIO_OVERLAY_REQUESTED=0
+AUDIO_EARLY_HELP_REQUESTED=0
 
 AUDIO_CARD_WAIT_SECS="${AUDIO_CARD_WAIT_SECS:-30}"
 AUDIO_CARD_REQUIRED="${AUDIO_CARD_REQUIRED:-auto}"
@@ -54,10 +65,15 @@ DMESG_SCAN="${DMESG_SCAN:-1}"
 VERBOSE="${VERBOSE:-0}"
 
 usage() {
-    cat <<EOF
+    cat <<EOF_USAGE
 Usage: $0 [options]
 
 Options:
+  --overlay
+      On Debian, ensure the Qualcomm AudioReach package set before validating
+      ALSA card registration. Without this flag, use the native/base audio
+      stack. This test never starts or restarts PipeWire.
+
   --wait-secs N
       Wait time for ALSA sound card registration.
       Default: 30
@@ -78,15 +94,15 @@ Options:
 
   --require-pcm-node {0|1}
       Require at least one /proc/asound/pcm entry for matched cards.
-      Default: 0
+      Default: 1
 
   --require-playback-pcm {0|1}
       Require playback PCM entry for matched cards.
-      Default: 0
+      Default: 1
 
   --require-capture-pcm {0|1}
       Require capture PCM entry for matched cards.
-      Default: 0
+      Default: 1
 
   --dmesg-scan {0|1}
       Enable or disable audio-related dmesg scan.
@@ -103,15 +119,112 @@ Options:
 
 Examples:
   $0
+  $0 --overlay
   $0 --required required
   $0 --card-match qcom
   $0 --require-pcm-node 1
   $0 --require-playback-pcm 1 --require-capture-pcm 1
-EOF
+EOF_USAGE
 }
+
+# Pre-parse the privileged package-selection and help options without
+# consuming the normal parser input.
+for audio_arg in "$@"; do
+    case "$audio_arg" in
+        --overlay)
+            AUDIO_OVERLAY_REQUESTED=1
+            ;;
+        --help|-h)
+            AUDIO_EARLY_HELP_REQUESTED=1
+            ;;
+    esac
+done
+
+export AUDIO_OVERLAY_REQUESTED
+
+# Help must not install packages, modify group membership, create result files,
+# or start a user manager.
+if [ "$AUDIO_EARLY_HELP_REQUESTED" -eq 1 ]; then
+    usage
+    exit 0
+fi
+
+# Resolve absolute output paths. The complete runner remains the root
+# orchestrator on Debian, so logs, results, inventory, and dmesg evidence stay
+# root-owned.
+RES_FILE="$SCRIPT_DIR/$TESTNAME.res"
+LOGDIR="$SCRIPT_DIR/results/$TESTNAME"
+
+# Package preparation is privileged and runs exactly once in the root runner.
+if ! command -v audio_prepare_test_packages >/dev/null 2>&1; then
+    log_fail "$TESTNAME FAIL: required helper is unavailable: audio_prepare_test_packages"
+    echo "$TESTNAME FAIL" > "$RES_FILE"
+    exit 1
+fi
+
+audio_prepare_test_packages "$AUDIO_OVERLAY_REQUESTED"
+audio_prepare_rc=$?
+
+case "$audio_prepare_rc" in
+    0)
+        ;;
+    2)
+        log_skip "$TESTNAME SKIP: AudioReach kernel package changed; reboot required"
+        echo "$TESTNAME SKIP" > "$RES_FILE"
+        exit 0
+        ;;
+    *)
+        log_fail "$TESTNAME FAIL: audio package preparation failed"
+        echo "$TESTNAME FAIL" > "$RES_FILE"
+        exit 1
+        ;;
+esac
+
+# Prepare only the Debian Audio account and group membership. This ALSA-only
+# testcase does not require a systemd user manager and does not re-execute the
+# complete runner as debian.
+if ! command -v audio_prepare_debian_audio_environment >/dev/null 2>&1; then
+    log_fail "$TESTNAME FAIL: required helper is unavailable: audio_prepare_debian_audio_environment"
+    echo "$TESTNAME FAIL" > "$RES_FILE"
+    exit 1
+fi
+
+if ! audio_prepare_debian_audio_environment 0; then
+    log_fail "$TESTNAME FAIL: Debian Audio environment preparation failed"
+    echo "$TESTNAME FAIL" > "$RES_FILE"
+    exit 1
+fi
+
+if ! command -v audio_run_helper_as_test_user >/dev/null 2>&1; then
+    log_fail "$TESTNAME FAIL: required helper is unavailable: audio_run_helper_as_test_user"
+    echo "$TESTNAME FAIL" > "$RES_FILE"
+    exit 1
+fi
+
+if ! mkdir -p "$LOGDIR"; then
+    log_fail "$TESTNAME FAIL: failed to create log directory: $LOGDIR"
+    echo "$TESTNAME FAIL" > "$RES_FILE"
+    exit 1
+fi
+
+if ! chmod 0755 "$LOGDIR"; then
+    log_fail "$TESTNAME FAIL: failed to make log directory readable for ALSA user validation"
+    echo "$TESTNAME FAIL" > "$RES_FILE"
+    exit 1
+fi
+
+if ! : > "$RES_FILE"; then
+    log_fail "$TESTNAME FAIL: failed to initialize result file: $RES_FILE"
+    exit 1
+fi
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --overlay)
+            AUDIO_OVERLAY_REQUESTED=1
+            export AUDIO_OVERLAY_REQUESTED
+            shift
+            ;;
         --wait-secs)
             if [ $# -lt 2 ]; then
                 echo "[ERROR] --wait-secs requires an argument" >&2
@@ -260,24 +373,24 @@ esac
 test_path="$(find_test_case_by_name "$TESTNAME" 2>/dev/null || echo "$SCRIPT_DIR")"
 if ! cd "$test_path"; then
     log_fail "cd failed: $test_path"
+    echo "$TESTNAME FAIL" > "$RES_FILE"
     exit 1
 fi
 
-RES_FILE="./$TESTNAME.res"
-LOGDIR="./results/$TESTNAME"
-
-mkdir -p "$LOGDIR" 2>/dev/null || true
-: > "$RES_FILE"
-
-if ! CHECK_DEPS_NO_EXIT=1 check_dependencies awk grep sed cat ls find sleep wc; then
+if ! CHECK_DEPS_NO_EXIT=1 check_dependencies awk grep sed cat ls find sleep wc chmod; then
     log_skip "$TESTNAME SKIP: missing required dependencies"
     echo "$TESTNAME SKIP" > "$RES_FILE"
     exit 0
 fi
 
+# This testcase intentionally performs no PipeWire/PulseAudio runtime setup.
+# Do not call audio_prepare_overlay_runtime(), audio_restart_pipewire_service(),
+# or audio_restart_services_best_effort() here. Only the ALSA node validation
+# helpers below are executed as the Debian Audio user.
+
 log_info "--------------------------------------------------------------------------"
 log_info "------------------- Starting $TESTNAME Testcase --------------------------"
-log_info "Config, AUDIO_CARD_WAIT_SECS=$AUDIO_CARD_WAIT_SECS AUDIO_CARD_REQUIRED=$AUDIO_CARD_REQUIRED AUDIO_CARD_MATCH=${AUDIO_CARD_MATCH:-<unset>}"
+log_info "Config, AUDIO_OVERLAY_REQUESTED=$AUDIO_OVERLAY_REQUESTED AUDIO_CARD_WAIT_SECS=$AUDIO_CARD_WAIT_SECS AUDIO_CARD_REQUIRED=$AUDIO_CARD_REQUIRED AUDIO_CARD_MATCH=${AUDIO_CARD_MATCH:-<unset>}"
 log_info "Config, REQUIRE_CONTROL_NODE=$REQUIRE_CONTROL_NODE REQUIRE_PCM_NODE=$REQUIRE_PCM_NODE REQUIRE_PLAYBACK_PCM=$REQUIRE_PLAYBACK_PCM REQUIRE_CAPTURE_PCM=$REQUIRE_CAPTURE_PCM DMESG_SCAN=$DMESG_SCAN"
 
 if command -v detect_platform >/dev/null 2>&1; then
@@ -344,7 +457,18 @@ if ! audio_card_wait_for_cards "$AUDIO_CARD_WAIT_SECS" "$AUDIO_CARD_MATCH"; then
 fi
 
 MATCHED_CARDS_FILE="$LOGDIR/matched_cards.txt"
-: > "$MATCHED_CARDS_FILE"
+
+if ! : > "$MATCHED_CARDS_FILE"; then
+    log_fail "$TESTNAME FAIL: failed to initialize matched card inventory"
+    echo "$TESTNAME FAIL" > "$RES_FILE"
+    exit 0
+fi
+
+if ! chmod 0644 "$MATCHED_CARDS_FILE"; then
+    log_fail "$TESTNAME FAIL: failed to make matched card inventory readable for the Audio user"
+    echo "$TESTNAME FAIL" > "$RES_FILE"
+    exit 0
+fi
 
 if [ -n "$AUDIO_CARD_MATCH" ]; then
     audio_card_find_matching_cards "$AUDIO_CARD_MATCH" > "$MATCHED_CARDS_FILE"
@@ -367,7 +491,9 @@ done < "$MATCHED_CARDS_FILE"
 test_failed=0
 
 if [ "$REQUIRE_CONTROL_NODE" -eq 1 ]; then
-    if ! audio_card_validate_control_nodes "$MATCHED_CARDS_FILE"; then
+    if ! audio_run_helper_as_test_user \
+        audio_card_validate_control_nodes \
+        "$MATCHED_CARDS_FILE"; then
         test_failed=1
     fi
 else
@@ -375,7 +501,10 @@ else
 fi
 
 if [ "$REQUIRE_PCM_NODE" -eq 1 ]; then
-    if ! audio_card_validate_pcm_nodes "$MATCHED_CARDS_FILE" "any"; then
+    if ! audio_run_helper_as_test_user \
+        audio_card_validate_pcm_nodes \
+        "$MATCHED_CARDS_FILE" \
+        "any"; then
         test_failed=1
     fi
 else
@@ -383,7 +512,10 @@ else
 fi
 
 if [ "$REQUIRE_PLAYBACK_PCM" -eq 1 ]; then
-    if ! audio_card_validate_pcm_nodes "$MATCHED_CARDS_FILE" "playback"; then
+    if ! audio_run_helper_as_test_user \
+        audio_card_validate_pcm_nodes \
+        "$MATCHED_CARDS_FILE" \
+        "playback"; then
         test_failed=1
     fi
 else
@@ -391,7 +523,10 @@ else
 fi
 
 if [ "$REQUIRE_CAPTURE_PCM" -eq 1 ]; then
-    if ! audio_card_validate_pcm_nodes "$MATCHED_CARDS_FILE" "capture"; then
+    if ! audio_run_helper_as_test_user \
+        audio_card_validate_pcm_nodes \
+        "$MATCHED_CARDS_FILE" \
+        "capture"; then
         test_failed=1
     fi
 else
@@ -412,3 +547,4 @@ fi
 
 log_info "------------------- Completed $TESTNAME Testcase --------------------------"
 exit 0
+

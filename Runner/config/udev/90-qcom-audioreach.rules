@@ -1,0 +1,10 @@
+# Qualcomm AudioReach runtime permissions.
+#
+# Audio tests execute as the Debian audio user rather than root. The dma-heap
+# device therefore needs group read/write access through the standard audio
+# group.
+#
+# The test automation installs this rule into /run/udev/rules.d on applicable
+# Debian AudioReach overlay runs.
+ 
+SUBSYSTEM=="dma_heap", KERNEL=="system", OWNER="root", GROUP="audio", MODE="0660"

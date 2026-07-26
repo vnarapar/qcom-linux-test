@@ -33,6 +33,14 @@ fi
 # shellcheck disable=SC1091
 . "$TOOLS/audio_common.sh"
 
+# audio_prepare_test_packages() in audio_common.sh reuses these helpers.
+# Source the provider only when it was not already loaded by a shared library.
+if ! command -v pkg_detect_os_id >/dev/null 2>&1 &&
+   [ -r "$TOOLS/lib_pkg_provider.sh" ]; then
+  # shellcheck disable=SC1090,SC1091
+  . "$TOOLS/lib_pkg_provider.sh"
+fi
+
 SYSTEMD_AVAILABLE=0
 if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
   SYSTEMD_AVAILABLE=1
@@ -41,22 +49,46 @@ fi
 TESTNAME="AudioRecord"
 RESULT_TESTNAME="$TESTNAME"
 RES_SUFFIX="" # Optional suffix for unique result files (e.g., "Config1")
-# RES_FILE will be set after parsing command-line arguments
+# RES_FILE and LOGDIR are resolved by the early non-consuming pre-parser
 
-# Pre-parse --res-suffix and --lava-testcase-id for early failure handling
-# This ensures unique result files and unique testcase IDs even if setup fails in parallel CI runs
-prev_arg=""
+# Pre-parse the options required by privileged Audio preparation without
+# consuming the original argument list. The complete original "$@" must remain
+# available for the root-to-debian re-exec performed below.
+AUDIO_OVERLAY_REQUESTED=0
+AUDIO_EARLY_HELP_REQUESTED=0
+AUDIO_EARLY_EXPECT=""
+
 for arg in "$@"; do
-  case "$prev_arg" in
-    --res-suffix)
+  case "$AUDIO_EARLY_EXPECT" in
+    res-suffix)
       RES_SUFFIX="$arg"
+      AUDIO_EARLY_EXPECT=""
+      continue
       ;;
-    --lava-testcase-id)
+    lava-testcase-id)
       RESULT_TESTNAME="$arg"
+      AUDIO_EARLY_EXPECT=""
+      continue
       ;;
   esac
-  prev_arg="$arg"
+
+  case "$arg" in
+    --overlay)
+      AUDIO_OVERLAY_REQUESTED=1
+      ;;
+    --res-suffix)
+      AUDIO_EARLY_EXPECT="res-suffix"
+      ;;
+    --lava-testcase-id)
+      AUDIO_EARLY_EXPECT="lava-testcase-id"
+      ;;
+    --help|-h)
+      AUDIO_EARLY_HELP_REQUESTED=1
+      ;;
+  esac
 done
+
+export AUDIO_OVERLAY_REQUESTED
 
 # ---------------- Defaults / CLI ----------------
 AUDIO_BACKEND=""
@@ -69,6 +101,17 @@ STRICT="${STRICT:-0}"
 DMESG_SCAN="${DMESG_SCAN:-1}"
 VERBOSE=0
 JUNIT_OUT=""
+
+# Capture paths are assigned by audio_record_set_capture_paths() from
+# audio_common.sh before every recording attempt. Declare them here so the
+# runner owns the shared state explicitly and static analysis can track it.
+record_out=""
+record_user_out=""
+
+# Explicit AudioReach overlay selection and WAV signal policy.
+# AUDIO_OVERLAY_REQUESTED was derived above without consuming the CLI.
+AUDIO_RECORD_STRICT_SIGNAL="${AUDIO_RECORD_STRICT_SIGNAL:-auto}"
+export AUDIO_OVERLAY_REQUESTED AUDIO_RECORD_STRICT_SIGNAL
 
 # Minimal ramdisk audio bootstrap options
 AUDIO_BOOTSTRAP_MODE="${AUDIO_BOOTSTRAP_MODE:-auto}" # auto|true|false
@@ -89,6 +132,8 @@ usage() {
 Usage: $0 [options]
   --backend {pipewire|pulseaudio|alsa}
   --source {mic|null}
+  --overlay              Prepare the Debian Qualcomm AudioReach overlay
+                         Without this flag, use the native/base stack.
   --config-name "record_config1" # Test specific config(s) by name (space-separated)
                                  # Also supports record_config1, record_config2, ..., record_config10
   --config-filter "48KHz" # Filter configs by pattern
@@ -124,8 +169,81 @@ Examples:
 EOF
 }
 
+# Keep Debian service recovery inside the prepared user manager. Preserve the
+# existing broad best-effort recovery only for native/Yocto execution.
+# --help must not install packages, change user groups, create output files, or
+# start a systemd user manager.
+if [ "$AUDIO_EARLY_HELP_REQUESTED" -eq 1 ]; then
+  usage
+  exit 0
+fi
+
+# Resolve root-owned result and log paths before privileged preparation.
+if [ -n "$RES_SUFFIX" ]; then
+  RES_FILE="$SCRIPT_DIR/${TESTNAME}_${RES_SUFFIX}.res"
+  LOGDIR="$SCRIPT_DIR/results/${TESTNAME}_${RES_SUFFIX}"
+  log_info "Using unique result file: $RES_FILE"
+  log_info "Using unique log directory: $LOGDIR"
+else
+  RES_FILE="$SCRIPT_DIR/${TESTNAME}.res"
+  LOGDIR="$SCRIPT_DIR/results/${TESTNAME}"
+fi
+
+# Package and udev preparation remain privileged. The complete runner stays
+# the root orchestrator on Debian.
+if ! command -v audio_prepare_test_packages >/dev/null 2>&1; then
+  log_fail "$TESTNAME FAIL - required helper is unavailable: audio_prepare_test_packages"
+  echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+  exit 1
+fi
+
+audio_prepare_test_packages \
+  "$AUDIO_OVERLAY_REQUESTED"
+audio_prepare_rc=$?
+
+case "$audio_prepare_rc" in
+  0)
+    ;;
+  2)
+    log_skip "$TESTNAME SKIP - AudioReach kernel package changed; reboot required"
+    echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
+    exit 0
+    ;;
+  *)
+    log_fail "$TESTNAME FAIL - audio package preparation failed"
+    echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+    exit 1
+    ;;
+esac
+
+# Root owns the final result, logs, summaries, diagnostics, and WAV artifacts.
+if ! mkdir -p "$LOGDIR"; then
+  log_fail "$TESTNAME FAIL - failed to create log directory: $LOGDIR"
+  echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+  exit 1
+fi
+
+# The Debian Audio user needs traverse-only access to reach its dedicated
+# scratch capture directory. Final logs and WAV artifacts remain root-owned.
+if ! chmod 0755 "$LOGDIR"; then
+  log_fail "$TESTNAME FAIL - failed to set log directory traversal mode: $LOGDIR"
+  echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+  exit 1
+fi
+
+if ! : >"$LOGDIR/summary.txt"; then
+  log_fail "$TESTNAME FAIL - failed to initialize summary file: $LOGDIR/summary.txt"
+  echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+  exit 1
+fi
+
 while [ $# -gt 0 ]; do
   case "$1" in
+    --overlay)
+      AUDIO_OVERLAY_REQUESTED=1
+      export AUDIO_OVERLAY_REQUESTED
+      shift
+      ;;
     --backend)
       AUDIO_BACKEND="$2"
       shift 2
@@ -214,36 +332,131 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# Generate result file path with optional suffix (after parsing CLI args)
-# Use absolute path anchored to SCRIPT_DIR for consistency
-if [ -n "$RES_SUFFIX" ]; then
-  RES_FILE="$SCRIPT_DIR/${TESTNAME}_${RES_SUFFIX}.res"
-  log_info "Using unique result file: $RES_FILE"
+case "$AUDIO_RECORD_STRICT_SIGNAL" in
+  auto)
+    AUDIO_RECORD_STRICT_SIGNAL="$STRICT"
+    ;;
+  0|1)
+    ;;
+  *)
+    log_warn "Invalid AUDIO_RECORD_STRICT_SIGNAL='$AUDIO_RECORD_STRICT_SIGNAL'; using 0"
+    AUDIO_RECORD_STRICT_SIGNAL=0
+    ;;
+esac
+export AUDIO_RECORD_STRICT_SIGNAL
+
+# Prepare only the Debian user capabilities required by the selected mode.
+# Explicit base ALSA capture needs group membership but no systemd user
+# manager. Overlay and managed backends require the user session.
+AUDIO_RECORD_USER_MANAGER_REQUIRED=1
+if [ "$AUDIO_OVERLAY_REQUESTED" -eq 0 ] &&
+   [ "$AUDIO_BACKEND" = "alsa" ]; then
+  AUDIO_RECORD_USER_MANAGER_REQUIRED=0
+fi
+
+for audio_required_helper in \
+  audio_prepare_debian_audio_environment \
+  audio_run_as_test_user \
+  audio_run_helper_as_test_user \
+  audio_run_with_timeout_as_test_user
+do
+  if ! command -v "$audio_required_helper" >/dev/null 2>&1; then
+    log_fail "$TESTNAME FAIL - required helper is unavailable: $audio_required_helper"
+    echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+    exit 1
+  fi
+done
+
+if ! audio_prepare_debian_audio_environment \
+    "$AUDIO_RECORD_USER_MANAGER_REQUIRED"; then
+  log_fail "$TESTNAME FAIL - Debian Audio environment preparation failed"
+  echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+  exit 1
+fi
+
+AUDIO_RECORD_DEBIAN_ROOT_MODE=0
+if command -v pkg_detect_os_id >/dev/null 2>&1; then
+  AUDIO_RECORD_OS_ID="$(pkg_detect_os_id 2>/dev/null || echo unknown)"
 else
-  RES_FILE="$SCRIPT_DIR/${TESTNAME}.res"
+  AUDIO_RECORD_OS_ID="$(
+    sed -n 's/^ID=//p' /etc/os-release 2>/dev/null |
+      sed -n '1p' |
+      sed 's/^"//;s/"$//' |
+      tr '[:upper:]' '[:lower:]'
+  )"
 fi
 
-# Initialize LOGDIR after parsing CLI args (to apply RES_SUFFIX correctly)
-# Use absolute paths for LOGDIR to work from any directory
-# Apply suffix for unique log directories per invocation (matches RES_FILE behavior)
-LOGDIR="$SCRIPT_DIR/results/${TESTNAME}"
-if [ -n "$RES_SUFFIX" ]; then
-  LOGDIR="${LOGDIR}_${RES_SUFFIX}"
-  log_info "Using unique log directory: $LOGDIR"
+if [ "$AUDIO_RECORD_OS_ID" = "debian" ]; then
+  AUDIO_RECORD_DEBIAN_ROOT_MODE=1
 fi
-mkdir -p "$LOGDIR"
 
-# Initialize summary file to prevent accumulation from previous test runs
-: > "$LOGDIR/summary.txt"
+export AUDIO_RECORD_DEBIAN_ROOT_MODE
 
-# Overlay setup must happen after CLI parsing so --help can exit cleanly.
-# Make it best-effort; later backend recovery logic will handle retry/bootstrap.
-if [ "$SYSTEMD_AVAILABLE" -eq 1 ]; then
+# Only this scratch directory is writable by the Debian Audio user. Root keeps
+# ownership of the final LOGDIR, logs, summary, JUnit data, and promoted WAVs.
+AUDIO_RECORD_USER_CAPTURE_DIR="$LOGDIR/.user-capture"
+export AUDIO_RECORD_USER_CAPTURE_DIR
+
+if [ "$AUDIO_RECORD_DEBIAN_ROOT_MODE" -eq 1 ]; then
+  rm -rf "$AUDIO_RECORD_USER_CAPTURE_DIR"
+
+  if ! mkdir -p "$AUDIO_RECORD_USER_CAPTURE_DIR"; then
+    log_fail "$TESTNAME FAIL - failed to create Audio user capture directory"
+    echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+    exit 1
+  fi
+
+  if ! chown "${AUDIO_TEST_USER:-debian}:audio" \
+      "$AUDIO_RECORD_USER_CAPTURE_DIR"; then
+    log_fail "$TESTNAME FAIL - failed to assign Audio user capture directory"
+    echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+    exit 1
+  fi
+
+  if ! chmod 0770 "$AUDIO_RECORD_USER_CAPTURE_DIR"; then
+    log_fail "$TESTNAME FAIL - failed to set Audio user capture directory mode"
+    echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+    exit 1
+  fi
+
+  log_pass "Prepared Debian Audio capture workspace: $AUDIO_RECORD_USER_CAPTURE_DIR"
+fi
+
+# Debian overlay runtime preparation runs from the root orchestrator after
+# normal CLI parsing. Only its device and PipeWire probes execute as debian.
+if [ "$AUDIO_OVERLAY_REQUESTED" -eq 1 ]; then
+  if ! command -v audio_prepare_overlay_runtime >/dev/null 2>&1; then
+    log_fail "$TESTNAME FAIL - required helper is unavailable: audio_prepare_overlay_runtime"
+    echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+    exit 1
+  fi
+
+  audio_prepare_overlay_runtime "$AUDIO_OVERLAY_REQUESTED"
+  audio_runtime_rc=$?
+
+  case "$audio_runtime_rc" in
+    0)
+      ;;
+    2)
+      log_skip "$TESTNAME SKIP - AudioReach kernel package changed; reboot required"
+      echo "$RESULT_TESTNAME SKIP" >"$RES_FILE"
+      exit 0
+      ;;
+    *)
+      log_fail "$TESTNAME FAIL - AudioReach runtime preparation failed"
+      echo "$RESULT_TESTNAME FAIL" >"$RES_FILE"
+      exit 1
+      ;;
+  esac
+elif [ "$SYSTEMD_AVAILABLE" -eq 1 ] &&
+     [ "$AUDIO_RECORD_DEBIAN_ROOT_MODE" -ne 1 ]; then
+  # Preserve the existing native/Yocto validation path. Debian base mode uses
+  # command-level user probes during backend discovery instead.
   if ! setup_overlay_audio_environment; then
-    log_warn "Overlay audio environment setup failed; continuing with backend recovery flow"
+    log_warn "Existing overlay audio environment validation failed; continuing with backend recovery flow"
   fi
 else
-  log_info "systemd not available; skipping overlay audio environment setup (minimal ramdisk mode)"
+  log_info "systemd not available; skipping legacy overlay environment check"
 fi
 
 # Minimal ramdisk detection and cleanup trap (kills any manually bootstrapped daemons)
@@ -303,11 +516,11 @@ if [ -n "$CONFIG_NAMES" ] && [ -n "$CONFIG_FILTER" ]; then
   CONFIG_FILTER=""
 fi
 
-log_info "Args: backend=${AUDIO_BACKEND:-auto} source=$SRC_CHOICE loops=$LOOPS durations='$DURATIONS' record_seconds=$RECORD_SECONDS timeout=$TIMEOUT strict=$STRICT dmesg=$DMESG_SCAN bootstrap=$AUDIO_BOOTSTRAP_MODE runtime_dir=${AUDIO_RUNTIME_DIR:-auto}"
+log_info "Args: backend=${AUDIO_BACKEND:-auto} source=$SRC_CHOICE overlay=$AUDIO_OVERLAY_REQUESTED loops=$LOOPS durations='$DURATIONS' record_seconds=$RECORD_SECONDS timeout=$TIMEOUT strict=$STRICT signal_strict=$AUDIO_RECORD_STRICT_SIGNAL dmesg=$DMESG_SCAN bootstrap=$AUDIO_BOOTSTRAP_MODE runtime_dir=${AUDIO_RUNTIME_DIR:-auto}"
 
 # Resolve backend (allow minimal-build ALSA capture fallback)
 if [ -z "$AUDIO_BACKEND" ]; then
-  AUDIO_BACKEND="$(detect_audio_backend 2>/dev/null || echo "")"
+  AUDIO_BACKEND="$(audio_run_helper_as_test_user --require-session detect_audio_backend 2>/dev/null || echo "")"
 fi
 
 AUDIO_SYSTEMD_MANAGED=0
@@ -329,12 +542,11 @@ AUDIO_ALSA_CAPTURE_CHANNELS=""
 AUDIO_ALSA_CAPTURE_REASON=""
 
 if [ -z "$AUDIO_BACKEND" ]; then
-  if audio_bootstrap_backend_if_needed; then
-    AUDIO_BACKEND="$(detect_audio_backend 2>/dev/null || echo "")"
-    AUDIO_SYSTEMD_MANAGED=0
-    export AUDIO_SYSTEMD_MANAGED
+  if audio_record_bootstrap_backend_if_needed; then
+    AUDIO_BACKEND="$(audio_run_helper_as_test_user --require-session detect_audio_backend 2>/dev/null || echo "")"
+    audio_record_set_recovered_backend_management
   else
-    if audio_probe_alsa_capture_profile; then
+    if audio_record_probe_alsa_capture_profile; then
       ALSA_CAPTURE_PROBED=1
       AUDIO_BACKEND="alsa"
       AUDIO_SYSTEMD_MANAGED=0
@@ -355,16 +567,16 @@ if [ "$AUDIO_BACKEND" = "alsa" ]; then
   if [ "$ALSA_CAPTURE_PROBED" -eq 1 ]; then
     backend_ok=1
   else
-    if audio_probe_alsa_capture_profile; then
+    if audio_record_probe_alsa_capture_profile; then
       ALSA_CAPTURE_PROBED=1
       backend_ok=1
     fi
   fi
 else
-  if audio_backend_ready "$AUDIO_BACKEND"; then
+  if audio_run_helper_as_test_user --require-session audio_backend_ready "$AUDIO_BACKEND"; then
     backend_ok=1
   else
-    if check_audio_daemon "$AUDIO_BACKEND"; then
+    if audio_run_helper_as_test_user --require-session check_audio_daemon "$AUDIO_BACKEND"; then
       backend_ok=1
     fi
   fi
@@ -373,28 +585,27 @@ fi
 if [ "$backend_ok" -ne 1 ] && [ "$AUDIO_BACKEND" != "alsa" ]; then
   if [ "$SYSTEMD_AVAILABLE" -eq 1 ] && [ "${AUDIO_SYSTEMD_MANAGED:-0}" -eq 1 ]; then
     log_warn "$TESTNAME: backend not available ($AUDIO_BACKEND) - attempting restart+retry once"
-    audio_restart_services_best_effort >/dev/null 2>&1 || true
-    audio_wait_audio_ready 20 >/dev/null 2>&1 || true
-    if audio_backend_ready "$AUDIO_BACKEND"; then
+    audio_record_restart_backend_best_effort "$AUDIO_BACKEND" >/dev/null 2>&1 || true
+    audio_run_helper_as_test_user --require-session audio_wait_audio_ready 20 "$AUDIO_BACKEND" >/dev/null 2>&1 || true
+    if audio_run_helper_as_test_user --require-session audio_backend_ready "$AUDIO_BACKEND"; then
       backend_ok=1
     else
-      if check_audio_daemon "$AUDIO_BACKEND"; then
+      if audio_run_helper_as_test_user --require-session check_audio_daemon "$AUDIO_BACKEND"; then
         backend_ok=1
       fi
     fi
   else
     log_warn "$TESTNAME: backend not available ($AUDIO_BACKEND) - attempting manual bootstrap"
-    if audio_bootstrap_backend_if_needed; then
+    if audio_record_bootstrap_backend_if_needed; then
       backend_ok=1
-      AUDIO_SYSTEMD_MANAGED=0
-      export AUDIO_SYSTEMD_MANAGED
-      AUDIO_BACKEND="$(detect_audio_backend 2>/dev/null || echo "$AUDIO_BACKEND")"
+      audio_record_set_recovered_backend_management
+      AUDIO_BACKEND="$(audio_run_helper_as_test_user --require-session detect_audio_backend 2>/dev/null || echo "$AUDIO_BACKEND")"
     fi
   fi
 fi
 
 if [ "$backend_ok" -ne 1 ] && [ "$AUDIO_BACKEND" != "alsa" ]; then
-  if audio_probe_alsa_capture_profile; then
+  if audio_record_probe_alsa_capture_profile; then
     ALSA_CAPTURE_PROBED=1
     AUDIO_BACKEND="alsa"
     AUDIO_SYSTEMD_MANAGED=0
@@ -446,36 +657,34 @@ esac
 
 # ----- Control-plane sanity (prevents wpctl/pactl hangs during source selection) -----
 if [ "$AUDIO_BACKEND" = "pipewire" ]; then
-  if ! audio_pw_ctl_ok 2>/dev/null; then
+  if ! audio_run_helper_as_test_user --require-session audio_pw_ctl_ok 2>/dev/null; then
     if [ "$SYSTEMD_AVAILABLE" -eq 1 ] && [ "${AUDIO_SYSTEMD_MANAGED:-0}" -eq 1 ]; then
       log_warn "$TESTNAME: wpctl not responsive - attempting restart+retry once"
-      audio_restart_services_best_effort >/dev/null 2>&1 || true
-      audio_wait_audio_ready 20 >/dev/null 2>&1 || true
+      audio_record_restart_backend_best_effort "$AUDIO_BACKEND" >/dev/null 2>&1 || true
+      audio_run_helper_as_test_user --require-session audio_wait_audio_ready 20 "$AUDIO_BACKEND" >/dev/null 2>&1 || true
     else
       log_warn "$TESTNAME: wpctl not responsive - attempting manual bootstrap"
-      audio_bootstrap_backend_if_needed >/dev/null 2>&1 || true
-      AUDIO_SYSTEMD_MANAGED=0
-      export AUDIO_SYSTEMD_MANAGED
+      audio_record_bootstrap_backend_if_needed >/dev/null 2>&1 || true
+      audio_record_set_recovered_backend_management
     fi
-    if ! audio_pw_ctl_ok 2>/dev/null; then
+    if ! audio_run_helper_as_test_user --require-session audio_pw_ctl_ok 2>/dev/null; then
       log_skip "$TESTNAME SKIP - PipeWire control-plane not responsive"
       echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
       exit 0
     fi
   fi
 elif [ "$AUDIO_BACKEND" = "pulseaudio" ]; then
-  if ! audio_pa_ctl_ok 2>/dev/null; then
+  if ! audio_run_helper_as_test_user --require-session audio_pa_ctl_ok 2>/dev/null; then
     if [ "$SYSTEMD_AVAILABLE" -eq 1 ] && [ "${AUDIO_SYSTEMD_MANAGED:-0}" -eq 1 ]; then
       log_warn "$TESTNAME: pactl not responsive - attempting restart+retry once"
-      audio_restart_services_best_effort >/dev/null 2>&1 || true
-      audio_wait_audio_ready 20 >/dev/null 2>&1 || true
+      audio_record_restart_backend_best_effort "$AUDIO_BACKEND" >/dev/null 2>&1 || true
+      audio_run_helper_as_test_user --require-session audio_wait_audio_ready 20 "$AUDIO_BACKEND" >/dev/null 2>&1 || true
     else
       log_warn "$TESTNAME: pactl not responsive - attempting manual bootstrap"
-      audio_bootstrap_backend_if_needed >/dev/null 2>&1 || true
-      AUDIO_SYSTEMD_MANAGED=0
-      export AUDIO_SYSTEMD_MANAGED
+      audio_record_bootstrap_backend_if_needed >/dev/null 2>&1 || true
+      audio_record_set_recovered_backend_management
     fi
-    if ! audio_pa_ctl_ok 2>/dev/null; then
+    if ! audio_run_helper_as_test_user --require-session audio_pa_ctl_ok 2>/dev/null; then
       log_skip "$TESTNAME SKIP - PulseAudio control-plane not responsive"
       echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
       exit 0
@@ -487,16 +696,16 @@ fi
 SRC_ID=""
 case "$AUDIO_BACKEND:$SRC_CHOICE" in
   pipewire:null)
-    SRC_ID="$(pw_default_null_source)"
+    SRC_ID="$(audio_run_helper_as_test_user --require-session pw_default_null_source)"
     ;;
   pipewire:*)
-    SRC_ID="$(pw_default_mic)"
+    SRC_ID="$(audio_run_helper_as_test_user --require-session pw_default_mic)"
     ;;
   pulseaudio:null)
-    SRC_ID="$(pa_default_null_source)"
+    SRC_ID="$(audio_run_helper_as_test_user --require-session pa_default_null_source)"
     ;;
   pulseaudio:*)
-    SRC_ID="$(pa_default_mic)"
+    SRC_ID="$(audio_run_helper_as_test_user --require-session pa_default_mic)"
     ;;
   alsa:null)
     SRC_ID=""
@@ -505,7 +714,7 @@ case "$AUDIO_BACKEND:$SRC_CHOICE" in
     if [ "$ALSA_CAPTURE_PROBED" -eq 1 ] && [ -n "$AUDIO_ALSA_CAPTURE_DEVICE" ]; then
       SRC_ID="$AUDIO_ALSA_CAPTURE_DEVICE"
     else
-      SRC_ID="$(alsa_pick_capture)"
+      SRC_ID="$(audio_run_helper_as_test_user alsa_pick_capture)"
     fi
     ;;
 esac
@@ -517,16 +726,16 @@ esac
 # after creating empty files.
 if [ -z "$SRC_ID" ] && [ "$SRC_CHOICE" = "mic" ] && [ "$AUDIO_BACKEND" = "pipewire" ]; then
   log_warn "$TESTNAME: no concrete PipeWire mic source found; probing direct ALSA capture path"
- 
-  if audio_probe_alsa_capture_profile; then
+
+  if audio_record_probe_alsa_capture_profile; then
     ALSA_CAPTURE_PROBED=1
     AUDIO_BACKEND="alsa"
     AUDIO_SYSTEMD_MANAGED=0
     export AUDIO_SYSTEMD_MANAGED
- 
+
     SRC_ID="$AUDIO_ALSA_CAPTURE_DEVICE"
     SRC_LABEL="$SRC_ID"
- 
+
     log_warn "$TESTNAME: falling back to direct ALSA capture device: $SRC_ID"
   else
     log_skip "$TESTNAME SKIP - no real capture source available; PipeWire mic source missing and ALSA capture probe failed: ${AUDIO_ALSA_CAPTURE_REASON:-capture path unavailable}"
@@ -534,14 +743,14 @@ if [ -z "$SRC_ID" ] && [ "$SRC_CHOICE" = "mic" ] && [ "$AUDIO_BACKEND" = "pipewi
     exit 0
   fi
 fi
- 
+
 if [ -z "$SRC_ID" ] && [ "$SRC_CHOICE" = "mic" ] && [ "$AUDIO_BACKEND" != "pipewire" ]; then
   for b in $BACKENDS_TO_TRY; do
     [ "$b" = "$AUDIO_BACKEND" ] && continue
- 
+
     case "$b" in
       pipewire)
-        cand="$(pw_default_mic)"
+        cand="$(audio_run_helper_as_test_user --require-session pw_default_mic)"
         if [ -n "$cand" ]; then
           AUDIO_BACKEND="pipewire"
           SRC_ID="$cand"
@@ -550,7 +759,7 @@ if [ -z "$SRC_ID" ] && [ "$SRC_CHOICE" = "mic" ] && [ "$AUDIO_BACKEND" != "pipew
         fi
         ;;
       pulseaudio)
-        cand="$(pa_default_mic)"
+        cand="$(audio_run_helper_as_test_user --require-session pa_default_mic)"
         if [ -n "$cand" ]; then
           AUDIO_BACKEND="pulseaudio"
           SRC_ID="$cand"
@@ -559,15 +768,15 @@ if [ -z "$SRC_ID" ] && [ "$SRC_CHOICE" = "mic" ] && [ "$AUDIO_BACKEND" != "pipew
         fi
         ;;
       alsa)
-        if audio_probe_alsa_capture_profile; then
+        if audio_record_probe_alsa_capture_profile; then
           ALSA_CAPTURE_PROBED=1
           AUDIO_BACKEND="alsa"
           AUDIO_SYSTEMD_MANAGED=0
           export AUDIO_SYSTEMD_MANAGED
- 
+
           SRC_ID="$AUDIO_ALSA_CAPTURE_DEVICE"
           SRC_LABEL="$SRC_ID"
- 
+
           log_info "Falling back to backend: alsa (device=$SRC_ID)"
           break
         fi
@@ -575,7 +784,7 @@ if [ -z "$SRC_ID" ] && [ "$SRC_CHOICE" = "mic" ] && [ "$AUDIO_BACKEND" != "pipew
     esac
   done
 fi
- 
+
 if [ -z "$SRC_ID" ]; then
   log_skip "$TESTNAME SKIP - requested source '$SRC_CHOICE' not available on any backend (${BACKENDS_TO_TRY:-unknown})"
   echo "$RESULT_TESTNAME SKIP" > "$RES_FILE"
@@ -607,7 +816,9 @@ if [ "$AUDIO_BACKEND" = "alsa" ]; then
     hw:[0-9]*,[0-9]*|plughw:[0-9]*,[0-9]*)
       : ;;
     *)
-      cand="$(arecord -l 2>/dev/null | sed -n 's/^card[[:space:]]*\([0-9][0-9]*\).*device[[:space:]]*\([0-9][0-9]*\).*/hw:\1,\2/p' | head -n 1)"
+      cand="$(audio_run_as_test_user arecord -l 2>/dev/null |
+        sed -n 's/^card[[:space:]]*\([0-9][0-9]*\).*device[[:space:]]*\([0-9][0-9]*\).*/hw:\1,\2/p' |
+        head -n 1)"
       if [ -z "$cand" ]; then
         cand="$(sed -n 's/^\([0-9][0-9]*\)-\([0-9][0-9]*\):.*capture.*/hw:\1,\2/p' /proc/asound/pcm 2>/dev/null | head -n 1)"
       fi
@@ -626,8 +837,8 @@ fi
 # ---- Routing log / defaults per backend ----
 if [ "$AUDIO_BACKEND" = "pipewire" ]; then
   if [ -n "$SRC_ID" ]; then
-    SRC_LABEL="$(pw_source_label_safe "$SRC_ID")"
-    pw_set_default_source "$SRC_ID" >/dev/null 2>&1 || true
+    SRC_LABEL="$(audio_run_helper_as_test_user --require-session pw_source_label_safe "$SRC_ID")"
+    audio_run_helper_as_test_user --require-session pw_set_default_source "$SRC_ID" >/dev/null 2>&1 || true
     [ -z "$SRC_LABEL" ] && SRC_LABEL="unknown"
     log_info "Routing to source: id/name=$SRC_ID label='$SRC_LABEL' choice=$SRC_CHOICE"
   else
@@ -635,8 +846,8 @@ if [ "$AUDIO_BACKEND" = "pipewire" ]; then
     log_info "Routing to source: id/name=default label='default' choice=$SRC_CHOICE"
   fi
 elif [ "$AUDIO_BACKEND" = "pulseaudio" ]; then
-  SRC_LABEL="$(pa_source_name "$SRC_ID" 2>/dev/null || echo "$SRC_ID")"
-  pa_set_default_source "$SRC_ID" >/dev/null 2>&1 || true
+  SRC_LABEL="$(audio_run_helper_as_test_user --require-session pa_source_name "$SRC_ID" 2>/dev/null || echo "$SRC_ID")"
+  audio_run_helper_as_test_user --require-session pa_set_default_source "$SRC_ID" >/dev/null 2>&1 || true
   log_info "Routing to source: name='$SRC_LABEL' choice=$SRC_CHOICE"
 else # ALSA
   SRC_LABEL="${SRC_ID:-default}"
@@ -721,6 +932,47 @@ auto_secs_for() {
     long) echo "30s" ;;
     *) echo "5s" ;;
   esac
+}
+
+# Validate the final capture selected by the existing backend/retry flow.
+# Size remains useful only for deciding whether compatibility fallbacks should
+# run; PASS requires a structurally valid WAV with acceptable sample content.
+audio_record_validate_final_output() {
+  recording_valid=0
+  validation_expected_duration="$secs"
+  validation_requested_seconds="$(audio_parse_secs "$secs" 2>/dev/null || echo 0)"
+  validation_timeout_seconds="$(audio_parse_secs "$effective_timeout" 2>/dev/null || echo 0)"
+
+  [ -n "$validation_requested_seconds" ] || validation_requested_seconds=0
+  [ -n "$validation_timeout_seconds" ] || validation_timeout_seconds=0
+
+  if [ "$validation_timeout_seconds" -gt 0 ] 2>/dev/null &&
+     { [ "$validation_requested_seconds" -le 0 ] 2>/dev/null ||
+       [ "$validation_timeout_seconds" -lt "$validation_requested_seconds" ] 2>/dev/null; }; then
+    validation_expected_duration="$effective_timeout"
+  fi
+
+  AUDIO_WAV_VALIDATION_SUMMARY="AUDIO_WAV_VALIDATION status=FAIL reason=not-run"
+  export AUDIO_WAV_VALIDATION_SUMMARY
+
+  if audio_validate_recording_result \
+      "$record_out" \
+      "$SRC_CHOICE" \
+      "${validation_rate:-0}" \
+      "${validation_channels:-0}" \
+      "$validation_expected_duration" \
+      "$rc" \
+      "$effective_timeout" \
+      "$logf"; then
+    recording_valid=1
+
+    case "$rc" in
+      124|137|143)
+        # Normalize an expected watchdog stop only after WAV validation passes.
+        rc=0
+        ;;
+    esac
+  fi
 }
 
 # ------------- Test Execution (Matrix or Config Discovery) -------------
@@ -819,56 +1071,56 @@ if [ "$USE_CONFIG_DISCOVERY" = "true" ]; then
 
       log_info "[$case_name] loop $i/$LOOPS start=$iso rate=${rate}Hz channels=$channels backend=$AUDIO_BACKEND $loop_hdr"
 
-      record_out="$LOGDIR/${case_name}.wav"
-      : > "$record_out"
+      audio_record_set_capture_paths "$case_name"
+      audio_record_reset_capture_output
       start_s="$(date +%s 2>/dev/null || echo 0)"
+      validation_rate="$rate"
+      validation_channels="$channels"
 
       if [ "$AUDIO_BACKEND" = "pipewire" ]; then
-        log_info "[$case_name] exec: pw-record -v --rate=$rate --channels=$channels \"$record_out\""
-        audio_exec_with_timeout "$effective_timeout" pw-record -v --rate="$rate" --channels="$channels" "$record_out" >> "$logf" 2>&1
+        log_info "[$case_name] exec: pw-record -v --rate=$rate --channels=$channels \"$record_user_out\""
+        audio_run_with_timeout_as_test_user --require-session "$effective_timeout" pw-record -v --rate="$rate" --channels="$channels" "$record_user_out" >> "$logf" 2>&1
         rc=$?
-        bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
+        bytes="$(audio_record_capture_size)"
 
         # If pw-record failed AND PipeWire control-plane is broken, restart/bootstrap and retry once
-        if [ "$rc" -ne 0 ] && ! audio_pw_ctl_ok 2>/dev/null; then
+        if [ "$rc" -ne 0 ] &&
+           ! audio_run_helper_as_test_user --require-session audio_pw_ctl_ok 2>/dev/null; then
           if [ "$SYSTEMD_AVAILABLE" -eq 1 ] && [ "${AUDIO_SYSTEMD_MANAGED:-0}" -eq 1 ]; then
             log_warn "[$case_name] pw-record rc=$rc and wpctl not responsive - restarting and retrying once"
-            audio_restart_services_best_effort >/dev/null 2>&1 || true
-            audio_wait_audio_ready 20 >/dev/null 2>&1 || true
+            audio_record_restart_backend_best_effort "$AUDIO_BACKEND" >/dev/null 2>&1 || true
+            audio_run_helper_as_test_user --require-session audio_wait_audio_ready 20 "$AUDIO_BACKEND" >/dev/null 2>&1 || true
           else
             log_warn "[$case_name] pw-record rc=$rc and wpctl not responsive - attempting bootstrap and retrying once"
-            audio_bootstrap_backend_if_needed >/dev/null 2>&1 || true
-            AUDIO_SYSTEMD_MANAGED=0
-            export AUDIO_SYSTEMD_MANAGED
+            audio_record_bootstrap_backend_if_needed >/dev/null 2>&1 || true
+            audio_record_set_recovered_backend_management
           fi
 
-          record_out="$LOGDIR/${case_name}.wav"
-          : > "$record_out"
-          log_info "[$case_name] retry: pw-record -v --rate=$rate --channels=$channels \"$record_out\""
-          audio_exec_with_timeout "$effective_timeout" pw-record -v --rate="$rate" --channels="$channels" "$record_out" >> "$logf" 2>&1
+          audio_record_set_capture_paths "$case_name"
+          audio_record_reset_capture_output
+          log_info "[$case_name] retry: pw-record -v --rate=$rate --channels=$channels \"$record_user_out\""
+          audio_run_with_timeout_as_test_user --require-session "$effective_timeout" pw-record -v --rate="$rate" --channels="$channels" "$record_user_out" >> "$logf" 2>&1
           rc=$?
-          bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
+          bytes="$(audio_record_capture_size)"
         fi
 
-        # If we already got real audio, accept and skip fallbacks
+        # A non-trivial file skips compatibility fallbacks. Content and
+        # recorder status are validated after the backend flow completes.
         if [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
-          if [ "$rc" -ne 0 ]; then
-            log_warn "[$case_name] nonzero rc=$rc but recording looks valid (bytes=$bytes) - PASS"
-            rc=0
-          fi
+          :
         else
           # Only if output is tiny/empty do we try a virtual PCM
           if command -v arecord >/dev/null 2>&1; then
-            pcm="$(alsa_pick_virtual_pcm || true)"
+            pcm="$(audio_run_helper_as_test_user alsa_pick_virtual_pcm || true)"
             if [ -n "$pcm" ]; then
               secs_int="$(audio_parse_secs "$secs" 2>/dev/null || echo 0)"
               [ -z "$secs_int" ] && secs_int=0
-              : > "$record_out"
-              log_info "[$case_name] fallback: arecord -D $pcm -f S16_LE -r $rate -c $channels -d $secs_int \"$record_out\""
-              audio_exec_with_timeout "$effective_timeout" \
-                arecord -D "$pcm" -f S16_LE -r "$rate" -c "$channels" -d "$secs_int" "$record_out" >> "$logf" 2>&1
+              audio_record_reset_capture_output
+              log_info "[$case_name] fallback: arecord -D $pcm -f S16_LE -r $rate -c $channels -d $secs_int \"$record_user_out\""
+              audio_run_with_timeout_as_test_user "$effective_timeout" \
+                arecord -D "$pcm" -f S16_LE -r "$rate" -c "$channels" -d "$secs_int" "$record_user_out" >> "$logf" 2>&1
               rc=$?
-              bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
+              bytes="$(audio_record_capture_size)"
             fi
           fi
 
@@ -882,29 +1134,23 @@ if [ "$USE_CONFIG_DISCOVERY" = "true" ]; then
             fi
           fi
           if [ "$retry_target" -eq 1 ] && [ -n "$SRC_ID" ]; then
-            : > "$record_out"
-            log_info "[$case_name] exec: pw-record -v --rate=$rate --channels=$channels --target \"$SRC_ID\" \"$record_out\""
-            audio_exec_with_timeout "$effective_timeout" pw-record -v --rate="$rate" --channels="$channels" --target "$SRC_ID" "$record_out" >> "$logf" 2>&1
+            audio_record_reset_capture_output
+            log_info "[$case_name] exec: pw-record -v --rate=$rate --channels=$channels --target \"$SRC_ID\" \"$record_user_out\""
+            audio_run_with_timeout_as_test_user --require-session "$effective_timeout" pw-record -v --rate="$rate" --channels="$channels" --target "$SRC_ID" "$record_user_out" >> "$logf" 2>&1
             rc=$?
-            bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
+            bytes="$(audio_record_capture_size)"
           fi
-        fi
-
-        # Optional safety: If nonzero rc but output is clearly valid, accept
-        if [ "$rc" -ne 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
-          log_warn "[$case_name] nonzero rc=$rc but recording looks valid (bytes=$bytes) - PASS"
-          rc=0
         fi
 
       else
         if [ "$AUDIO_BACKEND" = "alsa" ]; then
           secs_int="$(audio_parse_secs "$secs" 2>/dev/null || echo 0)"
           [ -z "$secs_int" ] && secs_int=0
-          log_info "[$case_name] exec: arecord -D \"$SRC_ID\" -f S16_LE -r $rate -c $channels -d $secs_int \"$record_out\""
-          audio_exec_with_timeout "$effective_timeout" \
-            arecord -D "$SRC_ID" -f S16_LE -r "$rate" -c "$channels" -d "$secs_int" "$record_out" >> "$logf" 2>&1
+          log_info "[$case_name] exec: arecord -D \"$SRC_ID\" -f S16_LE -r $rate -c $channels -d $secs_int \"$record_user_out\""
+          audio_run_with_timeout_as_test_user "$effective_timeout" \
+            arecord -D "$SRC_ID" -f S16_LE -r "$rate" -c "$channels" -d "$secs_int" "$record_user_out" >> "$logf" 2>&1
           rc=$?
-          bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
+          bytes="$(audio_record_capture_size)"
 
           retry_alsa=0
           if [ "$rc" -ne 0 ]; then
@@ -922,12 +1168,12 @@ if [ "$USE_CONFIG_DISCOVERY" = "true" ]; then
               alt_dev="$SRC_ID"
             fi
 
-            : > "$record_out"
-            log_info "[$case_name] retry: arecord -D \"$alt_dev\" -f S16_LE -r $rate -c $channels -d $secs_int \"$record_out\""
-            audio_exec_with_timeout "$effective_timeout" \
-              arecord -D "$alt_dev" -f S16_LE -r "$rate" -c "$channels" -d "$secs_int" "$record_out" >> "$logf" 2>&1
+            audio_record_reset_capture_output
+            log_info "[$case_name] retry: arecord -D \"$alt_dev\" -f S16_LE -r $rate -c $channels -d $secs_int \"$record_user_out\""
+            audio_run_with_timeout_as_test_user "$effective_timeout" \
+              arecord -D "$alt_dev" -f S16_LE -r "$rate" -c "$channels" -d "$secs_int" "$record_user_out" >> "$logf" 2>&1
             rc=$?
-            bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
+            bytes="$(audio_record_capture_size)"
 
             retry_fallback=0
             if [ "$rc" -ne 0 ]; then
@@ -950,12 +1196,14 @@ if [ "$USE_CONFIG_DISCOVERY" = "true" ]; then
                 fallback_ch="$(printf '%s\n' "$combo" | awk '{print $3}')"
                 [ -z "$fmt" ] || [ -z "$fallback_rate" ] || [ -z "$fallback_ch" ] && continue
 
-                : > "$record_out"
-                log_info "[$case_name] fallback: arecord -D \"$alt_dev\" -f $fmt -r $fallback_rate -c $fallback_ch -d $secs_int \"$record_out\""
-                audio_exec_with_timeout "$effective_timeout" \
-                  arecord -D "$alt_dev" -f "$fmt" -r "$fallback_rate" -c "$fallback_ch" -d "$secs_int" "$record_out" >> "$logf" 2>&1
+                audio_record_reset_capture_output
+                log_info "[$case_name] fallback: arecord -D \"$alt_dev\" -f $fmt -r $fallback_rate -c $fallback_ch -d $secs_int \"$record_user_out\""
+                audio_run_with_timeout_as_test_user "$effective_timeout" \
+                  arecord -D "$alt_dev" -f "$fmt" -r "$fallback_rate" -c "$fallback_ch" -d "$secs_int" "$record_user_out" >> "$logf" 2>&1
                 rc=$?
-                bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
+                bytes="$(audio_record_capture_size)"
+                validation_rate="$fallback_rate"
+                validation_channels="$fallback_ch"
                 if [ "$rc" -eq 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
                   break
                 fi
@@ -963,61 +1211,59 @@ if [ "$USE_CONFIG_DISCOVERY" = "true" ]; then
             fi
           fi
 
-          if [ "$rc" -ne 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
-            log_warn "[$case_name] nonzero rc=$rc but recording looks valid (bytes=$bytes) - PASS"
-            rc=0
-          fi
-
         else
           # PulseAudio
-          log_info "[$case_name] exec: parecord --rate=$rate --channels=$channels --file-format=wav \"$record_out\""
-          audio_exec_with_timeout "$effective_timeout" parecord --rate="$rate" --channels="$channels" --file-format=wav "$record_out" >> "$logf" 2>&1
+          log_info "[$case_name] exec: parecord --rate=$rate --channels=$channels --file-format=wav \"$record_user_out\""
+          audio_run_with_timeout_as_test_user --require-session "$effective_timeout" parecord --rate="$rate" --channels="$channels" --file-format=wav "$record_user_out" >> "$logf" 2>&1
           rc=$?
-          bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
+          bytes="$(audio_record_capture_size)"
 
           # If parecord failed AND PulseAudio control-plane is broken, restart/bootstrap and retry once
-          if [ "$rc" -ne 0 ] && ! audio_pa_ctl_ok 2>/dev/null; then
+          if [ "$rc" -ne 0 ] &&
+             ! audio_run_helper_as_test_user --require-session audio_pa_ctl_ok 2>/dev/null; then
             if [ "$SYSTEMD_AVAILABLE" -eq 1 ] && [ "${AUDIO_SYSTEMD_MANAGED:-0}" -eq 1 ]; then
               log_warn "[$case_name] parecord rc=$rc and pactl not responsive - restarting and retrying once"
-              audio_restart_services_best_effort >/dev/null 2>&1 || true
-              audio_wait_audio_ready 20 >/dev/null 2>&1 || true
+              audio_record_restart_backend_best_effort "$AUDIO_BACKEND" >/dev/null 2>&1 || true
+              audio_run_helper_as_test_user --require-session audio_wait_audio_ready 20 "$AUDIO_BACKEND" >/dev/null 2>&1 || true
             else
               log_warn "[$case_name] parecord rc=$rc and pactl not responsive - attempting bootstrap and retrying once"
-              audio_bootstrap_backend_if_needed >/dev/null 2>&1 || true
-              AUDIO_SYSTEMD_MANAGED=0
-              export AUDIO_SYSTEMD_MANAGED
-	   fi
+              audio_record_bootstrap_backend_if_needed >/dev/null 2>&1 || true
+              audio_record_set_recovered_backend_management
+            fi
 
-            record_out="$LOGDIR/${case_name}.wav"
-            : > "$record_out"
-            log_info "[$case_name] retry: parecord --rate=$rate --channels=$channels --file-format=wav \"$record_out\""
-            audio_exec_with_timeout "$effective_timeout" parecord --rate="$rate" --channels="$channels" --file-format=wav "$record_out" >> "$logf" 2>&1
+            audio_record_set_capture_paths "$case_name"
+            audio_record_reset_capture_output
+            log_info "[$case_name] retry: parecord --rate=$rate --channels=$channels --file-format=wav \"$record_user_out\""
+            audio_run_with_timeout_as_test_user --require-session "$effective_timeout" parecord --rate="$rate" --channels="$channels" --file-format=wav "$record_user_out" >> "$logf" 2>&1
             rc=$?
-            bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
+            bytes="$(audio_record_capture_size)"
           fi
 
-          if [ "$rc" -ne 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
-            log_warn "[$case_name] nonzero rc=$rc but recording looks valid (bytes=$bytes) - PASS"
-            rc=0
-          fi
         fi
+      fi
+
+      if ! audio_record_promote_capture_output; then
+        rc=1
+        bytes=0
       fi
 
       end_s="$(date +%s 2>/dev/null || echo 0)"
       last_elapsed=$((end_s - start_s))
       [ "$last_elapsed" -lt 0 ] && last_elapsed=0
 
+      audio_record_validate_final_output
+
       # Evidence
-      pw_ev="$(audio_evidence_pw_streaming || echo 0)"
-      pa_ev="$(audio_evidence_pa_streaming || echo 0)"
+      pw_ev="$(audio_run_helper_as_test_user --require-session audio_evidence_pw_streaming || echo 0)"
+      pa_ev="$(audio_run_helper_as_test_user --require-session audio_evidence_pa_streaming || echo 0)"
       if [ "$AUDIO_BACKEND" = "pulseaudio" ] && [ "$pa_ev" -eq 0 ]; then
-        if [ "$rc" -eq 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
+        if [ "$recording_valid" -eq 1 ]; then
           pa_ev=1
         fi
       fi
       alsa_ev="$(audio_evidence_alsa_running_any || echo 0)"
       asoc_ev="$(audio_evidence_asoc_path_on || echo 0)"
-      pwlog_ev="$(audio_evidence_pw_log_seen || echo 0)"
+      pwlog_ev="$(audio_run_helper_as_test_user --require-session audio_evidence_pw_log_seen || echo 0)"
       if [ "$AUDIO_BACKEND" = "pulseaudio" ]; then
         pwlog_ev=0
       fi
@@ -1035,13 +1281,13 @@ if [ "$USE_CONFIG_DISCOVERY" = "true" ]; then
         asoc_ev=1
       fi
 
-      log_info "[$case_name] evidence: pw_streaming=$pw_ev pa_streaming=$pa_ev alsa_running=$alsa_ev asoc_path_on=$asoc_ev bytes=${bytes:-0} pw_log=$pwlog_ev"
+      log_info "[$case_name] evidence: pw_streaming=$pw_ev pa_streaming=$pa_ev alsa_running=$alsa_ev asoc_path_on=$asoc_ev bytes=${bytes:-0} pw_log=$pwlog_ev validation='${AUDIO_WAV_VALIDATION_SUMMARY:-unavailable}'"
 
-      if [ "$rc" -eq 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
-        log_pass "[$case_name] loop $i OK (rc=0, ${last_elapsed}s, bytes=$bytes)"
+      if [ "$recording_valid" -eq 1 ]; then
+        log_pass "[$case_name] loop $i OK (rc=$rc, ${last_elapsed}s, bytes=$bytes, WAV payload validated)"
         ok_runs=$((ok_runs + 1))
       else
-        log_fail "[$case_name] loop $i FAILED (rc=$rc, ${last_elapsed}s, bytes=${bytes:-0}) - see $logf"
+        log_fail "[$case_name] loop $i FAILED (rc=$rc, ${last_elapsed}s, bytes=${bytes:-0}, validation='${AUDIO_WAV_VALIDATION_SUMMARY:-unavailable}') - see $logf"
       fi
 
       i=$((i + 1))
@@ -1116,56 +1362,58 @@ else
 
       log_info "[$case_name] loop $i/$LOOPS start=$iso secs=$secs backend=$AUDIO_BACKEND $loop_hdr"
 
-      record_out="$LOGDIR/${case_name}.wav"
-      : > "$record_out"
+      audio_record_set_capture_paths "$case_name"
+      audio_record_reset_capture_output
       start_s="$(date +%s 2>/dev/null || echo 0)"
+      validation_rate=0
+      validation_channels=0
 
       if [ "$AUDIO_BACKEND" = "pipewire" ]; then
-        log_info "[$case_name] exec: pw-record -v \"$record_out\""
-        audio_exec_with_timeout "$effective_timeout" pw-record -v "$record_out" >> "$logf" 2>&1
+        log_info "[$case_name] exec: pw-record -v \"$record_user_out\""
+        audio_run_with_timeout_as_test_user --require-session "$effective_timeout" pw-record -v "$record_user_out" >> "$logf" 2>&1
         rc=$?
-        bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
+        bytes="$(audio_record_capture_size)"
 
         # If pw-record failed AND PipeWire control-plane is broken, restart/bootstrap and retry once
-        if [ "$rc" -ne 0 ] && ! audio_pw_ctl_ok 2>/dev/null; then
+        if [ "$rc" -ne 0 ] &&
+           ! audio_run_helper_as_test_user --require-session audio_pw_ctl_ok 2>/dev/null; then
           if [ "$SYSTEMD_AVAILABLE" -eq 1 ] && [ "${AUDIO_SYSTEMD_MANAGED:-0}" -eq 1 ]; then
             log_warn "[$case_name] pw-record rc=$rc and wpctl not responsive - restarting and retrying once"
-            audio_restart_services_best_effort >/dev/null 2>&1 || true
-            audio_wait_audio_ready 20 >/dev/null 2>&1 || true
+            audio_record_restart_backend_best_effort "$AUDIO_BACKEND" >/dev/null 2>&1 || true
+            audio_run_helper_as_test_user --require-session audio_wait_audio_ready 20 "$AUDIO_BACKEND" >/dev/null 2>&1 || true
           else
             log_warn "[$case_name] pw-record rc=$rc and wpctl not responsive - attempting bootstrap and retrying once"
-            audio_bootstrap_backend_if_needed >/dev/null 2>&1 || true
-            AUDIO_SYSTEMD_MANAGED=0
-            export AUDIO_SYSTEMD_MANAGED
+            audio_record_bootstrap_backend_if_needed >/dev/null 2>&1 || true
+            audio_record_set_recovered_backend_management
           fi
 
-          record_out="$LOGDIR/${case_name}.wav"
-          : > "$record_out"
-          log_info "[$case_name] retry: pw-record -v \"$record_out\""
-          audio_exec_with_timeout "$effective_timeout" pw-record -v "$record_out" >> "$logf" 2>&1
+          audio_record_set_capture_paths "$case_name"
+          audio_record_reset_capture_output
+          log_info "[$case_name] retry: pw-record -v \"$record_user_out\""
+          audio_run_with_timeout_as_test_user --require-session "$effective_timeout" pw-record -v "$record_user_out" >> "$logf" 2>&1
           rc=$?
-          bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
+          bytes="$(audio_record_capture_size)"
         fi
 
-        # If we already got real audio, accept and skip fallbacks
+        # A non-trivial file skips compatibility fallbacks. Content and
+        # recorder status are validated after the backend flow completes.
         if [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
-          if [ "$rc" -ne 0 ]; then
-            log_warn "[$case_name] nonzero rc=$rc but recording looks valid (bytes=$bytes) - PASS"
-            rc=0
-          fi
-         else
+          :
+        else
           # Only if output is tiny/empty do we try a virtual PCM
           if command -v arecord >/dev/null 2>&1; then
-            pcm="$(alsa_pick_virtual_pcm || true)"
+            pcm="$(audio_run_helper_as_test_user alsa_pick_virtual_pcm || true)"
             if [ -n "$pcm" ]; then
               secs_int="$(audio_parse_secs "$secs" 2>/dev/null || echo 0)"
               [ -z "$secs_int" ] && secs_int=0
-              : > "$record_out"
-              log_info "[$case_name] fallback: arecord -D $pcm -f S16_LE -r 48000 -c 2 -d $secs_int \"$record_out\""
-              audio_exec_with_timeout "$effective_timeout" \
-                arecord -D "$pcm" -f S16_LE -r 48000 -c 2 -d "$secs_int" "$record_out" >> "$logf" 2>&1
+              audio_record_reset_capture_output
+              log_info "[$case_name] fallback: arecord -D $pcm -f S16_LE -r 48000 -c 2 -d $secs_int \"$record_user_out\""
+              audio_run_with_timeout_as_test_user "$effective_timeout" \
+                arecord -D "$pcm" -f S16_LE -r 48000 -c 2 -d "$secs_int" "$record_user_out" >> "$logf" 2>&1
               rc=$?
-              bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
+              bytes="$(audio_record_capture_size)"
+              validation_rate=48000
+              validation_channels=2
             fi
           fi
 
@@ -1179,29 +1427,25 @@ else
             fi
           fi
           if [ "$retry_target" -eq 1 ] && [ -n "$SRC_ID" ]; then
-            : > "$record_out"
-            log_info "[$case_name] exec: pw-record -v --target \"$SRC_ID\" \"$record_out\""
-            audio_exec_with_timeout "$effective_timeout" pw-record -v --target "$SRC_ID" "$record_out" >> "$logf" 2>&1
+            audio_record_reset_capture_output
+            log_info "[$case_name] exec: pw-record -v --target \"$SRC_ID\" \"$record_user_out\""
+            audio_run_with_timeout_as_test_user --require-session "$effective_timeout" pw-record -v --target "$SRC_ID" "$record_user_out" >> "$logf" 2>&1
             rc=$?
-            bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
+            bytes="$(audio_record_capture_size)"
           fi
-        fi
-
-        # Optional safety: If nonzero rc but output is clearly valid, accept
-        if [ "$rc" -ne 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
-          log_warn "[$case_name] nonzero rc=$rc but recording looks valid (bytes=$bytes) - PASS"
-          rc=0
         fi
 
       else
         if [ "$AUDIO_BACKEND" = "alsa" ]; then
           secs_int="$(audio_parse_secs "$secs" 2>/dev/null || echo 0)"
           [ -z "$secs_int" ] && secs_int=0
-          log_info "[$case_name] exec: arecord -D \"$SRC_ID\" -f S16_LE -r 48000 -c 2 -d $secs_int \"$record_out\""
-          audio_exec_with_timeout "$effective_timeout" \
-            arecord -D "$SRC_ID" -f S16_LE -r 48000 -c 2 -d "$secs_int" "$record_out" >> "$logf" 2>&1
+          log_info "[$case_name] exec: arecord -D \"$SRC_ID\" -f S16_LE -r 48000 -c 2 -d $secs_int \"$record_user_out\""
+          audio_run_with_timeout_as_test_user "$effective_timeout" \
+            arecord -D "$SRC_ID" -f S16_LE -r 48000 -c 2 -d "$secs_int" "$record_user_out" >> "$logf" 2>&1
           rc=$?
-          bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
+          bytes="$(audio_record_capture_size)"
+          validation_rate=48000
+          validation_channels=2
 
           retry_alsa=0
           if [ "$rc" -ne 0 ]; then
@@ -1230,73 +1474,73 @@ else
               ch="$(printf '%s\n' "$combo" | awk '{print $3}')"
               [ -z "$fmt" ] || [ -z "$rate" ] || [ -z "$ch" ] && continue
 
-              : > "$record_out"
-              log_info "[$case_name] retry: arecord -D \"$alt_dev\" -f $fmt -r $rate -c $ch -d $secs_int \"$record_out\""
-              audio_exec_with_timeout "$effective_timeout" \
-                arecord -D "$alt_dev" -f "$fmt" -r "$rate" -c "$ch" -d "$secs_int" "$record_out" >> "$logf" 2>&1
+              audio_record_reset_capture_output
+              log_info "[$case_name] retry: arecord -D \"$alt_dev\" -f $fmt -r $rate -c $ch -d $secs_int \"$record_user_out\""
+              audio_run_with_timeout_as_test_user "$effective_timeout" \
+                arecord -D "$alt_dev" -f "$fmt" -r "$rate" -c "$ch" -d "$secs_int" "$record_user_out" >> "$logf" 2>&1
               rc=$?
-              bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
+              bytes="$(audio_record_capture_size)"
+              validation_rate="$rate"
+              validation_channels="$ch"
               if [ "$rc" -eq 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
                 break
               fi
             done
           fi
 
-          if [ "$rc" -ne 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
-            log_warn "[$case_name] nonzero rc=$rc but recording looks valid (bytes=$bytes) - PASS"
-            rc=0
-          fi
-
         else
           # PulseAudio
-          log_info "[$case_name] exec: parecord --file-format=wav \"$record_out\""
-          audio_exec_with_timeout "$effective_timeout" parecord --file-format=wav "$record_out" >> "$logf" 2>&1
+          log_info "[$case_name] exec: parecord --file-format=wav \"$record_user_out\""
+          audio_run_with_timeout_as_test_user --require-session "$effective_timeout" parecord --file-format=wav "$record_user_out" >> "$logf" 2>&1
           rc=$?
-          bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
+          bytes="$(audio_record_capture_size)"
 
           # If parecord failed AND PulseAudio control-plane is broken, restart/bootstrap and retry once
-          if [ "$rc" -ne 0 ] && ! audio_pa_ctl_ok 2>/dev/null; then
+          if [ "$rc" -ne 0 ] &&
+             ! audio_run_helper_as_test_user --require-session audio_pa_ctl_ok 2>/dev/null; then
             if [ "$SYSTEMD_AVAILABLE" -eq 1 ] && [ "${AUDIO_SYSTEMD_MANAGED:-0}" -eq 1 ]; then
               log_warn "[$case_name] parecord rc=$rc and pactl not responsive - restarting and retrying once"
-              audio_restart_services_best_effort >/dev/null 2>&1 || true
-              audio_wait_audio_ready 20 >/dev/null 2>&1 || true
+              audio_record_restart_backend_best_effort "$AUDIO_BACKEND" >/dev/null 2>&1 || true
+              audio_run_helper_as_test_user --require-session audio_wait_audio_ready 20 "$AUDIO_BACKEND" >/dev/null 2>&1 || true
             else
               log_warn "[$case_name] parecord rc=$rc and pactl not responsive - attempting bootstrap and retrying once"
-              audio_bootstrap_backend_if_needed >/dev/null 2>&1 || true
-              AUDIO_SYSTEMD_MANAGED=0
-              export AUDIO_SYSTEMD_MANAGED
+              audio_record_bootstrap_backend_if_needed >/dev/null 2>&1 || true
+              audio_record_set_recovered_backend_management
             fi
 
-            record_out="$LOGDIR/${case_name}.wav"
-            : > "$record_out"
-            log_info "[$case_name] retry: parecord --file-format=wav \"$record_out\""
-            audio_exec_with_timeout "$effective_timeout" parecord --file-format=wav "$record_out" >> "$logf" 2>&1
+            audio_record_set_capture_paths "$case_name"
+            audio_record_reset_capture_output
+            log_info "[$case_name] retry: parecord --file-format=wav \"$record_user_out\""
+            audio_run_with_timeout_as_test_user --require-session "$effective_timeout" parecord --file-format=wav "$record_user_out" >> "$logf" 2>&1
             rc=$?
-            bytes="$(file_size_bytes "$record_out" 2>/dev/null || echo 0)"
+            bytes="$(audio_record_capture_size)"
           fi
 
-          if [ "$rc" -ne 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
-            log_warn "[$case_name] nonzero rc=$rc but recording looks valid (bytes=$bytes) - PASS"
-            rc=0
-          fi
         fi
+      fi
+
+      if ! audio_record_promote_capture_output; then
+        rc=1
+        bytes=0
       fi
 
       end_s="$(date +%s 2>/dev/null || echo 0)"
       last_elapsed=$((end_s - start_s))
       [ "$last_elapsed" -lt 0 ] && last_elapsed=0
 
+      audio_record_validate_final_output
+
       # Evidence
-      pw_ev="$(audio_evidence_pw_streaming || echo 0)"
-      pa_ev="$(audio_evidence_pa_streaming || echo 0)"
+      pw_ev="$(audio_run_helper_as_test_user --require-session audio_evidence_pw_streaming || echo 0)"
+      pa_ev="$(audio_run_helper_as_test_user --require-session audio_evidence_pa_streaming || echo 0)"
       if [ "$AUDIO_BACKEND" = "pulseaudio" ] && [ "$pa_ev" -eq 0 ]; then
-        if [ "$rc" -eq 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
+        if [ "$recording_valid" -eq 1 ]; then
           pa_ev=1
         fi
       fi
       alsa_ev="$(audio_evidence_alsa_running_any || echo 0)"
       asoc_ev="$(audio_evidence_asoc_path_on || echo 0)"
-      pwlog_ev="$(audio_evidence_pw_log_seen || echo 0)"
+      pwlog_ev="$(audio_run_helper_as_test_user --require-session audio_evidence_pw_log_seen || echo 0)"
       if [ "$AUDIO_BACKEND" = "pulseaudio" ]; then
         pwlog_ev=0
       fi
@@ -1314,13 +1558,13 @@ else
         asoc_ev=1
       fi
 
-      log_info "[$case_name] evidence: pw_streaming=$pw_ev pa_streaming=$pa_ev alsa_running=$alsa_ev asoc_path_on=$asoc_ev bytes=${bytes:-0} pw_log=$pwlog_ev"
+      log_info "[$case_name] evidence: pw_streaming=$pw_ev pa_streaming=$pa_ev alsa_running=$alsa_ev asoc_path_on=$asoc_ev bytes=${bytes:-0} pw_log=$pwlog_ev validation='${AUDIO_WAV_VALIDATION_SUMMARY:-unavailable}'"
 
-      if [ "$rc" -eq 0 ] && [ "${bytes:-0}" -gt 1024 ] 2>/dev/null; then
-        log_pass "[$case_name] loop $i OK (rc=0, ${last_elapsed}s, bytes=$bytes)"
+      if [ "$recording_valid" -eq 1 ]; then
+        log_pass "[$case_name] loop $i OK (rc=$rc, ${last_elapsed}s, bytes=$bytes, WAV payload validated)"
         ok_runs=$((ok_runs + 1))
       else
-        log_fail "[$case_name] loop $i FAILED (rc=$rc, ${last_elapsed}s, bytes=${bytes:-0}) - see $logf"
+        log_fail "[$case_name] loop $i FAILED (rc=$rc, ${last_elapsed}s, bytes=${bytes:-0}, validation='${AUDIO_WAV_VALIDATION_SUMMARY:-unavailable}') - see $logf"
       fi
 
       i=$((i + 1))
@@ -1355,7 +1599,7 @@ fi
 # Collect evidence once at end
 if [ "$DMESG_SCAN" -eq 1 ]; then
   scan_audio_dmesg "$LOGDIR"
-  dump_mixers "$LOGDIR/mixer_dump.txt"
+  audio_record_dump_mixers "$LOGDIR/mixer_dump.txt"
 fi
 
 # JUnit finalize (optional)
@@ -1395,3 +1639,4 @@ fi
 log_fail "$TESTNAME FAIL"
 echo "$RESULT_TESTNAME FAIL" > "$RES_FILE"
 exit 1
+
