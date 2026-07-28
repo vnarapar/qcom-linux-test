@@ -1445,16 +1445,58 @@ pkg_log_package_dependencies() {
     done
 }
 
-# Install apt package.
+# Install an apt package.
+#
+# Ordinary packages follow the global install-recommends policy.
+#
+# DKMS packages are handled differently:
+# - do not run apt-get -f install before installing the package, because a
+#   previously unpacked DKMS package may be configured before its recommended
+#   compiler/build dependencies are available
+# - explicitly enable APT recommendations so dkms, compiler, libc development
+#   files, fakeroot and related build requirements are selected by APT
 pkg_apt_install_package() {
     apt_install_pkg="$1"
+    apt_install_is_dkms=0
+
+    [ -n "$apt_install_pkg" ] || return 1
 
     pkg_apt_update || return 1
     pkg_apt_upgrade || return 1
-    pkg_apt_fix_broken_if_enabled || true
+
+    if pkg_is_dkms_package "$apt_install_pkg"; then
+        apt_install_is_dkms=1
+        pkg_log_info "DKMS package detected, enabling recommended build dependencies, pkg=$apt_install_pkg"
+        pkg_log_info "Skipping pre-install apt fix-broken for DKMS package, pkg=$apt_install_pkg"
+    else
+        pkg_apt_fix_broken_if_enabled || true
+    fi
 
     if command -v apt-cache >/dev/null 2>&1; then
-        apt-cache policy "$apt_install_pkg" 2>&1 | sed "s/^/[APT-POLICY:$apt_install_pkg] /" || true
+        apt-cache policy "$apt_install_pkg" 2>&1 |
+            sed "s/^/[APT-POLICY:$apt_install_pkg] /" ||
+            true
+    fi
+
+    if [ "$apt_install_is_dkms" -eq 1 ]; then
+        if pkg_bool_true "$PKG_APT_FIX_MISSING"; then
+            pkg_run_cmd_retry "apt-install-$apt_install_pkg" \
+                env DEBIAN_FRONTEND=noninteractive \
+                "$PKG_APT_GET" install -y \
+                --install-recommends \
+                --fix-missing \
+                -o "DPkg::Lock::Timeout=${PKG_APT_LOCK_TIMEOUT}" \
+                "$apt_install_pkg"
+        else
+            pkg_run_cmd_retry "apt-install-$apt_install_pkg" \
+                env DEBIAN_FRONTEND=noninteractive \
+                "$PKG_APT_GET" install -y \
+                --install-recommends \
+                -o "DPkg::Lock::Timeout=${PKG_APT_LOCK_TIMEOUT}" \
+                "$apt_install_pkg"
+        fi
+
+        return $?
     fi
 
     if pkg_bool_true "$PKG_APT_INSTALL_RECOMMENDS"; then

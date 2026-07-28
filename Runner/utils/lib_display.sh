@@ -673,37 +673,129 @@ adopt_wayland_env_from_socket() {
     return 0
 }
 
+# Return success when the currently exported Wayland environment is usable.
+#
+# The probe must validate only Wayland connectivity. It must not depend on
+# EGL, GLES, GLVND vendor selection, or GPU acceleration.
+#
+# Inputs:
+#   XDG_RUNTIME_DIR
+#   WAYLAND_DISPLAY
+#
+# Arguments:
+#   None
+#
+# Return:
+#   0 - the Wayland client probe succeeded
+#   1 - the Wayland client probe failed
 wayland_connection_ok() {
-    sock=""
-    if [ -n "${XDG_RUNTIME_DIR:-}" ] && [ -n "${WAYLAND_DISPLAY:-}" ]; then
-        sock="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
+    wco_socket=""
+    wco_rc=1
+    wco_pid=""
+    wco_probe_log="${TMPDIR:-/tmp}/wayland_connection_ok.$$"
+ 
+    if [ -n "${XDG_RUNTIME_DIR:-}" ] &&
+       [ -n "${WAYLAND_DISPLAY:-}" ]; then
+        case "$WAYLAND_DISPLAY" in
+            /*)
+                wco_socket="$WAYLAND_DISPLAY"
+                ;;
+            *)
+                wco_socket="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
+                ;;
+        esac
     fi
-    [ -n "$sock" ] || sock="<unknown>"
-    log_info "wayland_connection_ok: using socket $sock"
-
-    if ! command -v weston-simple-egl >/dev/null 2>&1; then
-        log_warn "wayland_connection_ok: weston-simple-egl not available; assuming OK"
-        return 0
-    fi
-
-    log_info "Probing Wayland by briefly starting weston-simple-egl"
-
-    if command -v run_with_timeout >/dev/null 2>&1; then
-        run_with_timeout "3s" weston-simple-egl >/dev/null 2>&1
-        rc=$?
-    else
-        weston-simple-egl >/dev/null 2>&1 &
-        pid=$!
-        sleep 3
-        kill "$pid" 2>/dev/null || true
-        rc=0
-    fi
-
-    if [ "$rc" -ne 0 ] && [ "$rc" -ne 143 ]; then
-        log_warn "wayland_connection_ok: weston-simple-egl probe returned $rc"
+ 
+    if [ -z "$wco_socket" ]; then
+        log_warn "wayland_connection_ok: Wayland environment is incomplete"
         return 1
     fi
-
+ 
+    log_info "wayland_connection_ok: using socket $wco_socket"
+ 
+    if [ ! -S "$wco_socket" ]; then
+        log_warn "wayland_connection_ok: Wayland socket is unavailable: $wco_socket"
+        return 1
+    fi
+ 
+    rm -f "$wco_probe_log"
+ 
+    if command -v wayland-info >/dev/null 2>&1; then
+        log_info "Probing Wayland connection with wayland-info"
+ 
+        if command -v run_with_timeout >/dev/null 2>&1; then
+            run_with_timeout \
+                "3s" \
+                wayland-info \
+                >"$wco_probe_log" 2>&1
+            wco_rc=$?
+        else
+            wayland-info >"$wco_probe_log" 2>&1
+            wco_rc=$?
+        fi
+ 
+        if [ "$wco_rc" -eq 0 ]; then
+            rm -f "$wco_probe_log"
+            log_pass "Wayland connection probe passed"
+            return 0
+        fi
+ 
+        log_warn "wayland_connection_ok: wayland-info returned $wco_rc"
+        sed -n '1,40p' "$wco_probe_log" 2>/dev/null || true
+        rm -f "$wco_probe_log"
+        return 1
+    fi
+ 
+    if ! command -v weston-simple-shm >/dev/null 2>&1; then
+        log_warn "wayland_connection_ok: no Wayland probe client is available"
+        log_warn "Expected wayland-info or weston-simple-shm"
+        return 1
+    fi
+ 
+    log_info "Probing Wayland connection with weston-simple-shm"
+ 
+    if command -v run_with_timeout >/dev/null 2>&1; then
+        run_with_timeout \
+            "3s" \
+            weston-simple-shm \
+            >"$wco_probe_log" 2>&1
+        wco_rc=$?
+ 
+        case "$wco_rc" in
+            0|124|137|143)
+                rm -f "$wco_probe_log"
+                log_pass "Wayland connection probe passed"
+                return 0
+                ;;
+            *)
+                log_warn "wayland_connection_ok: weston-simple-shm returned $wco_rc"
+                sed -n '1,40p' "$wco_probe_log" 2>/dev/null || true
+                rm -f "$wco_probe_log"
+                return 1
+                ;;
+        esac
+    fi
+ 
+    weston-simple-shm >"$wco_probe_log" 2>&1 &
+    wco_pid=$!
+ 
+    sleep 1
+ 
+    if ! kill -0 "$wco_pid" 2>/dev/null; then
+        wait "$wco_pid" 2>/dev/null
+        wco_rc=$?
+ 
+        log_warn "wayland_connection_ok: weston-simple-shm exited early, rc=$wco_rc"
+        sed -n '1,40p' "$wco_probe_log" 2>/dev/null || true
+        rm -f "$wco_probe_log"
+        return 1
+    fi
+ 
+    kill "$wco_pid" 2>/dev/null || true
+    wait "$wco_pid" 2>/dev/null || true
+    rm -f "$wco_probe_log"
+ 
+    log_pass "Wayland connection probe passed"
     return 0
 }
 
@@ -2196,63 +2288,146 @@ display_fps_gate_avg() {
     return 0
 }
 
-# Parse FPS samples from a weston-simple-egl style log.
-# Sets DISPLAY_FPS_COUNT / DISPLAY_FPS_AVG / DISPLAY_FPS_MIN / DISPLAY_FPS_MAX.
+# Parse FPS samples from a weston-simple-egl log.
+#
+# Supported formats:
+#   Weston 14:
+#     601 frames in 5 seconds: 120.199997 fps
+#
+#   Older Weston:
+#     601 frames in 5 seconds = 120.199997
+#
+# The first sample is discarded as warm-up when two or more samples exist.
+#
+# Exports through shell globals:
+#   DISPLAY_FPS_COUNT
+#   DISPLAY_FPS_AVG
+#   DISPLAY_FPS_MIN
+#   DISPLAY_FPS_MAX
+#
+# Return:
+#   0 - one or more usable FPS samples remain after warm-up handling
+#   1 - log is missing, unreadable, or contains no usable FPS samples
 display_parse_fps_log() {
-    logf="$1"
-
+    dpfl_log_file="$1"
+    dpfl_stats=""
+ 
     DISPLAY_FPS_COUNT=0
     DISPLAY_FPS_AVG="-"
     DISPLAY_FPS_MIN="-"
     DISPLAY_FPS_MAX="-"
-
-    [ -n "$logf" ] || return 1
-    [ -r "$logf" ] || return 1
-
-    fps_stats="$({
+ 
+    [ -n "$dpfl_log_file" ] || return 1
+    [ -r "$dpfl_log_file" ] || return 1
+ 
+    dpfl_stats="$(
         awk '
-            $1 ~ /^[0-9]+$/ &&
-            $2 == "frames" &&
-            $3 == "in" &&
-            $4 ~ /^[0-9]+([.][0-9]+)?$/ &&
-            $5 == "seconds" &&
-            $6 == "=" &&
-            $7 ~ /^[0-9]+([.][0-9]+)?$/ {
-                value = $7 + 0.0
-                count++
-                sum += value
-
-                if (count == 1 || value < min) {
-                    min = value
+            {
+                value = ""
+ 
+                for (i = 1; i <= NF; i++) {
+                    if ($i == "frames" &&
+                        i > 1 &&
+                        $(i + 1) == "in") {
+                        for (j = i + 2; j <= NF; j++) {
+                            # Weston 14:
+                            # 601 frames in 5 seconds: 120.199997 fps
+                            if ($j ~ /^seconds:$/) {
+                                value = $(j + 1)
+                                break
+                            }
+ 
+                            # Older Weston:
+                            # 601 frames in 5 seconds = 120.199997
+                            if ($j == "seconds" &&
+                                $(j + 1) == "=") {
+                                value = $(j + 2)
+                                break
+                            }
+                        }
+ 
+                        break
+                    }
                 }
-
-                if (count == 1 || value > max) {
-                    max = value
+ 
+                if (value ~ /^[0-9]+([.][0-9]+)?$/) {
+                    all_n++
+                    all_values[all_n] = value + 0.0
                 }
             }
-
+ 
             END {
+                if (all_n == 0) {
+                    exit 1
+                }
+ 
+                # Preserve the existing behavior: discard the first warm-up
+                # sample when two or more samples were collected.
+                first = (all_n > 1) ? 2 : 1
+                count = 0
+                sum = 0.0
+ 
+                for (i = first; i <= all_n; i++) {
+                    value = all_values[i]
+                    count++
+                    sum += value
+ 
+                    if (count == 1 || value < min) {
+                        min = value
+                    }
+ 
+                    if (count == 1 || value > max) {
+                        max = value
+                    }
+                }
+ 
                 if (count > 0) {
-                    printf "n=%d avg=%.6f min=%.6f max=%.6f\n", count, sum / count, min, max
+                    printf "n=%d avg=%.6f min=%.6f max=%.6f\n",
+                        count,
+                        sum / count,
+                        min,
+                        max
                 }
             }
-        ' "$logf" 2>/dev/null ||
-        true
-    } | head -n 1)"
-
-    [ -n "$fps_stats" ] || return 1
-
-    DISPLAY_FPS_COUNT="$(printf '%s\n' "$fps_stats" | awk '{print $1}' | sed 's/^n=//')"
-    DISPLAY_FPS_AVG="$(printf '%s\n' "$fps_stats" | awk '{print $2}' | sed 's/^avg=//')"
-    DISPLAY_FPS_MIN="$(printf '%s\n' "$fps_stats" | awk '{print $3}' | sed 's/^min=//')"
-    DISPLAY_FPS_MAX="$(printf '%s\n' "$fps_stats" | awk '{print $4}' | sed 's/^max=//')"
-
+        ' "$dpfl_log_file" 2>/dev/null
+    )" || true
+ 
+    [ -n "$dpfl_stats" ] || return 1
+ 
+    DISPLAY_FPS_COUNT="$(
+        printf '%s\n' "$dpfl_stats" |
+            awk '{ print $1 }' |
+            sed 's/^n=//'
+    )"
+ 
+    DISPLAY_FPS_AVG="$(
+        printf '%s\n' "$dpfl_stats" |
+            awk '{ print $2 }' |
+            sed 's/^avg=//'
+    )"
+ 
+    DISPLAY_FPS_MIN="$(
+        printf '%s\n' "$dpfl_stats" |
+            awk '{ print $3 }' |
+            sed 's/^min=//'
+    )"
+ 
+    DISPLAY_FPS_MAX="$(
+        printf '%s\n' "$dpfl_stats" |
+            awk '{ print $4 }' |
+            sed 's/^max=//'
+    )"
+ 
     case "$DISPLAY_FPS_COUNT" in
         ''|*[!0-9]*)
             DISPLAY_FPS_COUNT=0
+            DISPLAY_FPS_AVG="-"
+            DISPLAY_FPS_MIN="-"
+            DISPLAY_FPS_MAX="-"
+            return 1
             ;;
     esac
-
+ 
     [ "$DISPLAY_FPS_COUNT" -gt 0 ] 2>/dev/null || return 1
     return 0
 }
@@ -2430,18 +2605,34 @@ weston_systemd_service_user() {
     return 1
 }
 
-# Prefer the Wayland socket that belongs to the systemd-managed Weston user.
-# Fall back to generic discovery only when needed.
+# Prefer the Wayland socket that belongs to the active Weston runtime.
+#
+# Discovery order:
+# 1. Socket owned by the configured systemd weston.service user.
+# 2. Socket derived from a live Weston process:
+#    - XDG_RUNTIME_DIR from /proc/<pid>/environ
+#    - --socket from /proc/<pid>/cmdline
+# 3. Existing generic Wayland socket discovery.
+#
+# This allows a Weston runtime started by one testcase shell to be reused by
+# later testcase shells without hardcoding its runtime directory or socket name.
 weston_preferred_socket() {
     wps_user=""
     wps_uid=""
     wps_dir=""
     wps_sock=""
+    wps_pids=""
+    wps_pid=""
+    wps_runtime_dir=""
+    wps_socket_name=""
+    wps_candidate=""
 
     if wps_user="$(weston_systemd_service_user 2>/dev/null)"; then
         wps_uid="$(id -u "$wps_user" 2>/dev/null || true)"
+
         if [ -n "$wps_uid" ]; then
             wps_dir="/run/user/$wps_uid"
+
             if [ -d "$wps_dir" ]; then
                 for wps_sock in "$wps_dir"/wayland-*; do
                     if [ -S "$wps_sock" ]; then
@@ -2453,8 +2644,84 @@ weston_preferred_socket() {
         fi
     fi
 
+    if command -v pgrep >/dev/null 2>&1; then
+        wps_pids="$(pgrep -x weston 2>/dev/null || true)"
+    else
+        wps_pids="$(
+            ps -eo pid=,comm= 2>/dev/null |
+                awk '$2 == "weston" { print $1 }'
+        )"
+    fi
+
+    for wps_pid in $wps_pids; do
+        [ -r "/proc/$wps_pid/cmdline" ] || continue
+
+        wps_socket_name="$(
+            tr '\000' '\n' <"/proc/$wps_pid/cmdline" 2>/dev/null |
+                awk '
+                    take_socket {
+                        print
+                        exit
+                    }
+
+                    $0 == "--socket" {
+                        take_socket = 1
+                        next
+                    }
+
+                    /^--socket=/ {
+                        sub(/^--socket=/, "")
+                        print
+                        exit
+                    }
+                '
+        )"
+
+        wps_runtime_dir=""
+
+        if [ -r "/proc/$wps_pid/environ" ]; then
+            wps_runtime_dir="$(
+                tr '\000' '\n' <"/proc/$wps_pid/environ" 2>/dev/null |
+                    sed -n 's/^XDG_RUNTIME_DIR=//p' |
+                    head -n 1
+            )"
+        fi
+
+        if [ -n "$wps_socket_name" ]; then
+            case "$wps_socket_name" in
+                /*)
+                    wps_candidate="$wps_socket_name"
+                    ;;
+                *)
+                    if [ -n "$wps_runtime_dir" ]; then
+                        wps_candidate="$wps_runtime_dir/$wps_socket_name"
+                    else
+                        wps_candidate=""
+                    fi
+                    ;;
+            esac
+
+            if [ -n "$wps_candidate" ] &&
+               [ -S "$wps_candidate" ]; then
+                printf '%s\n' "$wps_candidate"
+                return 0
+            fi
+        fi
+
+        if [ -n "$wps_runtime_dir" ] &&
+           [ -d "$wps_runtime_dir" ]; then
+            for wps_sock in "$wps_runtime_dir"/wayland-*; do
+                if [ -S "$wps_sock" ]; then
+                    printf '%s\n' "$wps_sock"
+                    return 0
+                fi
+            done
+        fi
+    done
+
     if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
-        discover_wayland_socket_anywhere 2>/dev/null | head -n 1
+        discover_wayland_socket_anywhere 2>/dev/null |
+            head -n 1
         return 0
     fi
 
@@ -4389,5 +4656,1235 @@ display_get_primary_refresh_hz() {
     esac
 
     return 1
+}
+
+
+###############################################################################
+# Weston testcase integration helpers
+#
+# This block is intentionally limited to:
+# - minimal Weston package/client recovery on apt systems
+# - the already validated base/overlay graphics-stack transitions
+# - the existing image-managed Yocto Weston lifecycle
+# - testcase FPS policy
+#
+# It does not create users, TTY sessions, PAM configuration, udev rules,
+# systemd units, seatd instances, or standalone Weston processes.
+###############################################################################
+
+display_ensure_weston_test_dependencies() {
+    dewtd_client="${1:-weston-simple-egl}"
+    dewtd_os_id="unknown"
+    dewtd_provider="check"
+    dewtd_dependencies=""
+    dewtd_rc=0
+    dewtd_old_check_deps_no_exit="${CHECK_DEPS_NO_EXIT-__unset__}"
+
+    if command -v pkg_detect_os_id >/dev/null 2>&1; then
+        dewtd_os_id="$(pkg_detect_os_id 2>/dev/null || true)"
+    elif [ -r /etc/os-release ]; then
+        dewtd_os_id="$(
+            sed -n 's/^ID=//p' /etc/os-release |
+                head -n 1 |
+                tr -d '"' |
+                tr '[:upper:]' '[:lower:]'
+        )"
+    fi
+
+    [ -n "$dewtd_os_id" ] || dewtd_os_id="unknown"
+
+    if command -v pkg_active_provider >/dev/null 2>&1; then
+        dewtd_provider="$(pkg_active_provider 2>/dev/null || true)"
+    fi
+
+    [ -n "$dewtd_provider" ] || dewtd_provider="check"
+
+    case "$dewtd_os_id" in
+        debian|ubuntu)
+            if [ "$dewtd_provider" = "apt" ] &&
+               command -v pkg_ensure_required_package_set_present >/dev/null 2>&1; then
+                if ! pkg_ensure_required_package_set_present weston-runtime; then
+                    log_fail "Failed to ensure the minimal Weston runtime package set"
+                    return 1
+                fi
+            fi
+
+            dewtd_dependencies="$dewtd_client weston"
+            ;;
+
+        centos|rhel|fedora)
+            # RPM package names vary by release and repository. Keep this path
+            # check-only until explicit validated mappings are added.
+            dewtd_dependencies="$dewtd_client weston"
+            ;;
+
+        *)
+            # Preserve Yocto and other image-provided package behavior.
+            dewtd_dependencies="$dewtd_client"
+            ;;
+    esac
+
+    CHECK_DEPS_NO_EXIT=1
+    export CHECK_DEPS_NO_EXIT
+
+    if ! check_dependencies "$dewtd_dependencies"; then
+        dewtd_rc=1
+    fi
+
+    case "$dewtd_old_check_deps_no_exit" in
+        __unset__)
+            unset CHECK_DEPS_NO_EXIT
+            ;;
+        *)
+            CHECK_DEPS_NO_EXIT="$dewtd_old_check_deps_no_exit"
+            export CHECK_DEPS_NO_EXIT
+            ;;
+    esac
+
+    if [ "$dewtd_rc" -ne 0 ]; then
+        log_fail "Required Weston commands are unavailable, os=$dewtd_os_id commands=$dewtd_dependencies"
+        return 1
+    fi
+
+    log_pass "Weston testcase dependencies are ready, client=$dewtd_client"
+    return 0
+}
+
+
+# Return success when the named systemd unit currently exists.
+display_desktop_weston_unit_exists() {
+    ddwue_unit="${1:-qcom-testkit-weston.service}"
+    ddwue_load_state=""
+
+    command -v systemctl >/dev/null 2>&1 || return 1
+
+    ddwue_load_state="$(
+        systemctl show "$ddwue_unit" \
+            -p LoadState \
+            --value 2>/dev/null ||
+        true
+    )"
+
+    [ -n "$ddwue_load_state" ] &&
+        [ "$ddwue_load_state" != "not-found" ]
+}
+
+# Return success when the Weston log contains a fatal DRM/KMS startup error.
+display_desktop_weston_log_has_fatal_errors() {
+    ddwlhfe_log="${1:-}"
+
+    [ -n "$ddwlhfe_log" ] || return 1
+    [ -r "$ddwlhfe_log" ] || return 1
+
+    grep -Eiq \
+        "atomic: couldn.t commit new state: Permission denied|repaint-flush failed: Permission denied|failed to acquire DRM master|failed to initialize DRM backend|failed to create renderer|failed to open.*DRM" \
+        "$ddwlhfe_log"
+}
+
+# Adopt and validate one desktop Weston socket.
+display_adopt_desktop_weston_socket() {
+    dadws_socket="${1:-}"
+    dadws_log="${2:-}"
+
+    [ -n "$dadws_socket" ] || return 1
+    [ -S "$dadws_socket" ] || return 1
+
+    if command -v adopt_wayland_env_from_socket >/dev/null 2>&1; then
+        if ! adopt_wayland_env_from_socket "$dadws_socket"; then
+            return 1
+        fi
+    else
+        XDG_RUNTIME_DIR="$(dirname "$dadws_socket")"
+        WAYLAND_DISPLAY="$(basename "$dadws_socket")"
+        export XDG_RUNTIME_DIR
+        export WAYLAND_DISPLAY
+    fi
+
+    if command -v wayland_connection_ok >/dev/null 2>&1; then
+        if ! wayland_connection_ok; then
+            return 1
+        fi
+    fi
+
+    if [ -n "$dadws_log" ] &&
+       display_desktop_weston_log_has_fatal_errors "$dadws_log"; then
+        log_error "Weston reports fatal DRM/KMS errors: $dadws_log"
+        return 1
+    fi
+
+    DISPLAY_WAYLAND_SOCKET="$dadws_socket"
+    DISPLAY_RUNTIME_MODEL="desktop-systemd-transient"
+    export DISPLAY_WAYLAND_SOCKET
+    export DISPLAY_RUNTIME_MODEL
+
+    log_info "Wayland runtime model, $DISPLAY_RUNTIME_MODEL"
+    log_info "Wayland socket, $DISPLAY_WAYLAND_SOCKET"
+    log_info "XDG_RUNTIME_DIR, ${XDG_RUNTIME_DIR:-<unset>}"
+    log_info "WAYLAND_DISPLAY, ${WAYLAND_DISPLAY:-<unset>}"
+
+    return 0
+}
+
+# Stop the qcom-testkit transient Weston runtime.
+#
+# Arguments:
+#   $1 - restore display manager: 1=yes, 0=no, default=1
+#
+# This helper never removes packages or persistent system configuration.
+display_stop_transient_weston_runtime() {
+    dstwr_restore_dm="${1:-1}"
+    dstwr_unit="qcom-testkit-weston.service"
+    dstwr_runtime_dir="/run/qcom-testkit-weston"
+    dstwr_socket_name="wayland-qcom-testkit"
+    dstwr_state_file="$dstwr_runtime_dir/display-manager.state"
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl stop "$dstwr_unit" >/dev/null 2>&1 || true
+        systemctl reset-failed "$dstwr_unit" >/dev/null 2>&1 || true
+    fi
+
+    rm -f \
+        "$dstwr_runtime_dir/$dstwr_socket_name" \
+        "$dstwr_runtime_dir/$dstwr_socket_name.lock" \
+        2>/dev/null || true
+
+    if [ "$dstwr_restore_dm" -eq 1 ] 2>/dev/null &&
+       command -v display_restore_service_from_state >/dev/null 2>&1; then
+        display_restore_service_from_state "$dstwr_state_file" || return 1
+    fi
+
+    if [ "$dstwr_restore_dm" -eq 1 ] 2>/dev/null; then
+        rm -rf "$dstwr_runtime_dir" 2>/dev/null || true
+    fi
+
+    if [ "${DISPLAY_WAYLAND_SOCKET:-}" = "$dstwr_runtime_dir/$dstwr_socket_name" ]; then
+        unset DISPLAY_WAYLAND_SOCKET
+        unset DISPLAY_RUNTIME_MODEL
+        unset WAYLAND_DISPLAY
+        unset XDG_RUNTIME_DIR
+    fi
+
+    return 0
+}
+
+# Start the proven desktop Weston runtime through systemd-run.
+#
+# The command path intentionally matches the target-validated manual sequence:
+# - stop display-manager.service and record whether it was active
+# - create a root-owned XDG runtime directory
+# - start Weston as a transient system service
+# - use Weston/libseat default backend selection
+# - do not set LIBSEAT_BACKEND, SEATD_VTBOUND, or a custom seat
+#
+# Arguments:
+#   $1 - testcase/log tag
+#   $2 - socket startup timeout in seconds
+#
+# Return:
+#   0 - runtime is ready
+#   1 - runtime startup or validation failed
+display_start_transient_weston_runtime() {
+    dstwr_testname="${1:-display-test}"
+    dstwr_wait_secs="${2:-10}"
+    dstwr_unit="qcom-testkit-weston.service"
+    dstwr_runtime_dir="/run/qcom-testkit-weston"
+    dstwr_socket_name="wayland-qcom-testkit"
+    dstwr_socket="$dstwr_runtime_dir/$dstwr_socket_name"
+    dstwr_log="/tmp/qcom-testkit-weston.log"
+    dstwr_state_file="$dstwr_runtime_dir/display-manager.state"
+    dstwr_drm_device=""
+    dstwr_drm_card=""
+    dstwr_egl_json="${__EGL_VENDOR_LIBRARY_FILENAMES:-}"
+    dstwr_weston_bin=""
+    dstwr_wait=0
+    dstwr_started=0
+
+    case "$dstwr_wait_secs" in
+        ''|*[!0-9]*)
+            dstwr_wait_secs=10
+            ;;
+    esac
+
+    [ "$dstwr_wait_secs" -gt 0 ] 2>/dev/null || dstwr_wait_secs=10
+
+    for dstwr_command in systemctl systemd-run weston; do
+        if ! command -v "$dstwr_command" >/dev/null 2>&1; then
+            log_error "Cannot start desktop Weston, required command is unavailable: $dstwr_command"
+            return 1
+        fi
+    done
+
+    dstwr_weston_bin="$(command -v weston 2>/dev/null || true)"
+
+    if [ -z "$dstwr_weston_bin" ]; then
+        log_error "Cannot start desktop Weston, weston binary could not be resolved"
+        return 1
+    fi
+
+    if ! command -v display_select_primary_drm_device >/dev/null 2>&1; then
+        log_error "Cannot start desktop Weston, DRM selection helper is unavailable"
+        return 1
+    fi
+
+    if ! command -v display_stop_service_for_drm >/dev/null 2>&1; then
+        log_error "Cannot start desktop Weston, display-manager ownership helper is unavailable"
+        return 1
+    fi
+
+    dstwr_drm_device="$(
+        display_select_primary_drm_device 2>/dev/null ||
+        true
+    )"
+
+    if [ -z "$dstwr_drm_device" ] || [ ! -c "$dstwr_drm_device" ]; then
+        log_error "Cannot start desktop Weston, no usable primary DRM device was selected"
+        return 1
+    fi
+
+    dstwr_drm_card="${dstwr_drm_device##*/}"
+
+    if ! install -d -m 0700 -o root -g root "$dstwr_runtime_dir"; then
+        log_error "Failed to create Weston runtime directory: $dstwr_runtime_dir"
+        return 1
+    fi
+
+    # Preserve the original display-manager state across an explicit Weston
+    # relaunch. The stop helper intentionally recreates its state file, so do
+    # not call it again when the manager is already inactive and a valid state
+    # file from the initial startup exists.
+    if [ -s "$dstwr_state_file" ] &&
+       ! systemctl is-active --quiet display-manager.service; then
+        log_info "Display manager is already inactive, preserving recorded restore state"
+    elif ! display_stop_service_for_drm \
+        display-manager.service \
+        "$dstwr_drm_device" \
+        "$dstwr_state_file"; then
+        log_error "Failed to release display-manager DRM ownership"
+        return 1
+    fi
+
+    if command -v fuser >/dev/null 2>&1 &&
+       fuser "$dstwr_drm_device" >/dev/null 2>&1; then
+        log_error "DRM device is still in use after stopping the display manager: $dstwr_drm_device"
+        fuser -v "$dstwr_drm_device" 2>&1 |
+            while IFS= read -r dstwr_owner_line; do
+                [ -n "$dstwr_owner_line" ] || continue
+                log_info "[DRM-OWNER] $dstwr_owner_line"
+            done
+        display_restore_service_from_state "$dstwr_state_file" || true
+        return 1
+    fi
+
+    rm -f \
+        "$dstwr_socket" \
+        "$dstwr_socket.lock" \
+        "$dstwr_log"
+
+    log_info "Starting transient desktop Weston through systemd-run"
+    log_info "Weston unit, $dstwr_unit"
+    log_info "Weston DRM device, $dstwr_drm_device"
+    log_info "Weston runtime directory, $dstwr_runtime_dir"
+    log_info "Weston socket, $dstwr_socket"
+    log_info "Weston log, $dstwr_log"
+
+    if [ -n "$dstwr_egl_json" ]; then
+        log_info "Weston EGL vendor JSON, $dstwr_egl_json"
+    else
+        log_info "Weston EGL vendor JSON, native GLVND discovery"
+    fi
+
+    if display_desktop_weston_unit_exists "$dstwr_unit"; then
+        log_info "Reusing the existing transient unit definition"
+        systemctl reset-failed "$dstwr_unit" >/dev/null 2>&1 || true
+
+        if systemctl start "$dstwr_unit"; then
+            dstwr_started=1
+        fi
+    else
+        if [ -n "$dstwr_egl_json" ]; then
+            if systemd-run \
+                --unit="$dstwr_unit" \
+                --description="QCOM testkit Weston DRM runtime" \
+                --property=Type=simple \
+                --property=Restart=no \
+                --setenv="XDG_RUNTIME_DIR=$dstwr_runtime_dir" \
+                --setenv="__EGL_VENDOR_LIBRARY_FILENAMES=$dstwr_egl_json" \
+                "$dstwr_weston_bin" \
+                    -Bdrm \
+                    --renderer=gl \
+                    --drm-device="$dstwr_drm_card" \
+                    --current-mode \
+                    --continue-without-input \
+                    --idle-time=0 \
+                    --no-config \
+                    --socket="$dstwr_socket_name" \
+                    --log="$dstwr_log"; then
+                dstwr_started=1
+            fi
+        else
+            if systemd-run \
+                --unit="$dstwr_unit" \
+                --description="QCOM testkit Weston DRM runtime" \
+                --property=Type=simple \
+                --property=Restart=no \
+                --setenv="XDG_RUNTIME_DIR=$dstwr_runtime_dir" \
+                "$dstwr_weston_bin" \
+                    -Bdrm \
+                    --renderer=gl \
+                    --drm-device="$dstwr_drm_card" \
+                    --current-mode \
+                    --continue-without-input \
+                    --idle-time=0 \
+                    --no-config \
+                    --socket="$dstwr_socket_name" \
+                    --log="$dstwr_log"; then
+                dstwr_started=1
+            fi
+        fi
+    fi
+
+    if [ "$dstwr_started" -ne 1 ]; then
+        log_error "systemd could not start the transient Weston unit"
+        display_stop_transient_weston_runtime 1 || true
+        return 1
+    fi
+
+    while [ "$dstwr_wait" -lt "$dstwr_wait_secs" ]; do
+        if [ -S "$dstwr_socket" ]; then
+            break
+        fi
+
+        if ! systemctl is-active --quiet "$dstwr_unit"; then
+            break
+        fi
+
+        sleep 1
+        dstwr_wait=$((dstwr_wait + 1))
+    done
+
+    if [ ! -S "$dstwr_socket" ]; then
+        log_error "Transient Weston did not create its Wayland socket"
+        systemctl status "$dstwr_unit" --no-pager --full 2>&1 || true
+        journalctl -u "$dstwr_unit" -n 80 --no-pager 2>&1 || true
+        tail -n 80 "$dstwr_log" 2>/dev/null || true
+        display_stop_transient_weston_runtime 1 || true
+        return 1
+    fi
+
+    sleep 1
+
+    if ! display_adopt_desktop_weston_socket \
+        "$dstwr_socket" \
+        "$dstwr_log"; then
+        log_error "Transient Weston runtime validation failed"
+        tail -n 80 "$dstwr_log" 2>/dev/null || true
+        display_stop_transient_weston_runtime 1 || true
+        return 1
+    fi
+
+    DISPLAY_RUNTIME_OWNER="qcom-testkit-transient"
+    DISPLAY_TRANSIENT_WESTON_UNIT="$dstwr_unit"
+    DISPLAY_TRANSIENT_WESTON_LOG="$dstwr_log"
+    DISPLAY_TRANSIENT_WESTON_DRM_DEVICE="$dstwr_drm_device"
+    export DISPLAY_RUNTIME_OWNER
+    export DISPLAY_TRANSIENT_WESTON_UNIT
+    export DISPLAY_TRANSIENT_WESTON_LOG
+    export DISPLAY_TRANSIENT_WESTON_DRM_DEVICE
+
+    log_pass "Transient desktop Weston runtime is ready"
+    return 0
+}
+
+###############################################################################
+# Desktop Weston runtime, manual command promoted to shared helper
+#
+# This helper uses the exact direct DRM command validated manually on Debian:
+# - no seatd-launch
+# - no LIBSEAT_BACKEND override
+# - no PAM, TTY, udev, user, or systemd-unit creation
+# - no package operations
+#
+# It first adopts an existing Weston socket. When no Weston process exists, it
+# stops only the active display manager through the existing shared helper and
+# starts Weston on the dynamically selected DRM card.
+###############################################################################
+display_prepare_desktop_weston_runtime() {
+    dpdwr_testname="${1:-display-test}"
+    dpdwr_wait_secs="${2:-10}"
+    dpdwr_runtime_dir="${DISPLAY_DESKTOP_WESTON_RUNTIME_DIR:-/run/qcom-weston-manual}"
+    dpdwr_socket_name="${DISPLAY_DESKTOP_WESTON_SOCKET:-wayland-manual-test}"
+    dpdwr_socket_path="$dpdwr_runtime_dir/$dpdwr_socket_name"
+    dpdwr_weston_log="${DISPLAY_DESKTOP_WESTON_LOG:-/tmp/weston-manual.log}"
+    dpdwr_launch_log="${DISPLAY_DESKTOP_WESTON_LAUNCH_LOG:-/tmp/weston-manual-launch.log}"
+    dpdwr_state_file="$dpdwr_runtime_dir/display-manager.state"
+    dpdwr_drm_device=""
+    dpdwr_drm_card=""
+    dpdwr_candidate=""
+    dpdwr_runtime=""
+    dpdwr_socket=""
+    dpdwr_pid=""
+    dpdwr_wait=0
+    dpdwr_started=0
+    dpdwr_display_manager_stopped=0
+    dpdwr_old_xdg="${XDG_RUNTIME_DIR-__unset__}"
+    dpdwr_old_wayland="${WAYLAND_DISPLAY-__unset__}"
+
+    case "$dpdwr_wait_secs" in
+        ''|*[!0-9]*)
+            dpdwr_wait_secs=10
+            ;;
+    esac
+
+    [ "$dpdwr_wait_secs" -gt 0 ] 2>/dev/null || dpdwr_wait_secs=10
+
+    # First honor a working environment already exported by the caller.
+    if [ -n "${XDG_RUNTIME_DIR:-}" ] &&
+       [ -n "${WAYLAND_DISPLAY:-}" ]; then
+        dpdwr_candidate="$XDG_RUNTIME_DIR/$WAYLAND_DISPLAY"
+
+        if [ -S "$dpdwr_candidate" ] &&
+           command -v wayland_connection_ok >/dev/null 2>&1 &&
+           wayland_connection_ok; then
+            DISPLAY_WAYLAND_SOCKET="$dpdwr_candidate"
+            export DISPLAY_WAYLAND_SOCKET
+            log_pass "Existing desktop Weston runtime is usable, socket=$dpdwr_candidate"
+            return 0
+        fi
+    fi
+
+    # Derive the socket from a live Weston process environment and command line.
+    if command -v pgrep >/dev/null 2>&1; then
+        for dpdwr_pid in $(pgrep -x weston 2>/dev/null || true); do
+            [ -r "/proc/$dpdwr_pid/environ" ] || continue
+            [ -r "/proc/$dpdwr_pid/cmdline" ] || continue
+
+            dpdwr_runtime="$(
+                tr '\000' '\n' <"/proc/$dpdwr_pid/environ" 2>/dev/null |
+                    sed -n 's/^XDG_RUNTIME_DIR=//p' |
+                    head -n 1
+            )"
+
+            dpdwr_socket="$(
+                tr '\000' '\n' <"/proc/$dpdwr_pid/cmdline" 2>/dev/null |
+                    awk '
+                        previous == "--socket" {
+                            print
+                            exit
+                        }
+
+                        /^--socket=/ {
+                            sub(/^--socket=/, "")
+                            print
+                            exit
+                        }
+
+                        {
+                            previous = $0
+                        }
+                    '
+            )"
+
+            [ -n "$dpdwr_runtime" ] || continue
+            [ -n "$dpdwr_socket" ] || continue
+
+            dpdwr_candidate="$dpdwr_runtime/$dpdwr_socket"
+            [ -S "$dpdwr_candidate" ] || continue
+
+            if command -v adopt_wayland_env_from_socket >/dev/null 2>&1 &&
+               adopt_wayland_env_from_socket "$dpdwr_candidate"; then
+                if ! command -v wayland_connection_ok >/dev/null 2>&1 ||
+                   wayland_connection_ok; then
+                    DISPLAY_WAYLAND_SOCKET="$dpdwr_candidate"
+                    export DISPLAY_WAYLAND_SOCKET
+                    log_pass "Adopted existing desktop Weston runtime, socket=$dpdwr_candidate pid=$dpdwr_pid"
+                    return 0
+                fi
+            fi
+        done
+    fi
+
+    # Keep compatibility with existing generic discovery.
+    if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+        dpdwr_candidate="$(
+            discover_wayland_socket_anywhere 2>/dev/null |
+                head -n 1 ||
+                true
+        )"
+
+        if [ -n "$dpdwr_candidate" ] &&
+           [ -S "$dpdwr_candidate" ] &&
+           command -v adopt_wayland_env_from_socket >/dev/null 2>&1 &&
+           adopt_wayland_env_from_socket "$dpdwr_candidate"; then
+            if ! command -v wayland_connection_ok >/dev/null 2>&1 ||
+               wayland_connection_ok; then
+                DISPLAY_WAYLAND_SOCKET="$dpdwr_candidate"
+                export DISPLAY_WAYLAND_SOCKET
+                log_pass "Adopted discovered desktop Weston runtime, socket=$dpdwr_candidate"
+                return 0
+            fi
+        fi
+    fi
+
+    # Explicitly check the path used by the manually validated command.
+    if [ -S "$dpdwr_socket_path" ] &&
+       command -v adopt_wayland_env_from_socket >/dev/null 2>&1 &&
+       adopt_wayland_env_from_socket "$dpdwr_socket_path"; then
+        if ! command -v wayland_connection_ok >/dev/null 2>&1 ||
+           wayland_connection_ok; then
+            DISPLAY_WAYLAND_SOCKET="$dpdwr_socket_path"
+            export DISPLAY_WAYLAND_SOCKET
+            log_pass "Adopted validated desktop Weston runtime, socket=$dpdwr_socket_path"
+            return 0
+        fi
+    fi
+
+    # Never launch a second compositor over an unknown Weston process.
+    if command -v pgrep >/dev/null 2>&1 &&
+       pgrep -x weston >/dev/null 2>&1; then
+        log_error "A Weston process exists but no usable Wayland socket could be adopted"
+        return 1
+    fi
+
+    if ! command -v weston >/dev/null 2>&1; then
+        log_error "Cannot start desktop Weston, weston command is unavailable"
+        return 1
+    fi
+
+    if ! command -v display_select_primary_drm_device >/dev/null 2>&1; then
+        log_error "Cannot start desktop Weston, DRM selection helper is unavailable"
+        return 1
+    fi
+
+    dpdwr_drm_device="$(
+        display_select_primary_drm_device 2>/dev/null ||
+        true
+    )"
+
+    if [ -z "$dpdwr_drm_device" ] ||
+       [ ! -c "$dpdwr_drm_device" ]; then
+        log_error "Cannot start desktop Weston, no usable DRM card was selected"
+        return 1
+    fi
+
+    dpdwr_drm_card=${dpdwr_drm_device##*/}
+
+    if ! mkdir -p "$dpdwr_runtime_dir"; then
+        log_error "Could not create desktop Weston runtime directory, $dpdwr_runtime_dir"
+        return 1
+    fi
+
+    if ! chmod 0700 "$dpdwr_runtime_dir"; then
+        log_error "Could not set desktop Weston runtime directory permissions, $dpdwr_runtime_dir"
+        return 1
+    fi
+
+    rm -f \
+        "$dpdwr_socket_path" \
+        "$dpdwr_socket_path.lock" \
+        "$dpdwr_weston_log" \
+        "$dpdwr_launch_log"
+
+    # Reuse the existing display-manager ownership helper. The manager remains
+    # stopped while Weston owns DRM, matching the manually validated state.
+    if command -v display_stop_service_for_drm >/dev/null 2>&1; then
+        if ! display_stop_service_for_drm \
+            display-manager.service \
+            "$dpdwr_drm_device" \
+            "$dpdwr_state_file"; then
+            log_error "Could not release display-manager DRM ownership"
+            return 1
+        fi
+
+        if [ -s "$dpdwr_state_file" ]; then
+            dpdwr_display_manager_stopped=1
+        fi
+    elif command -v systemctl >/dev/null 2>&1 &&
+         systemctl is-active --quiet display-manager.service 2>/dev/null; then
+        log_error "Display manager is active and the shared DRM ownership helper is unavailable"
+        return 1
+    fi
+
+    log_info "Starting desktop Weston with the manually validated DRM command"
+    log_info "Desktop Weston DRM device, $dpdwr_drm_device"
+    log_info "Desktop Weston runtime directory, $dpdwr_runtime_dir"
+    log_info "Desktop Weston socket, $dpdwr_socket_path"
+    log_info "Desktop Weston log, $dpdwr_weston_log"
+
+    XDG_RUNTIME_DIR="$dpdwr_runtime_dir" \
+        nohup env \
+            -u LIBSEAT_BACKEND \
+            -u SEATD_SOCK \
+            -u SEATD_VTBOUND \
+            weston \
+                -Bdrm \
+                --renderer=gl \
+                --drm-device="$dpdwr_drm_card" \
+                --current-mode \
+                --continue-without-input \
+                --idle-time=0 \
+                --no-config \
+                --socket="$dpdwr_socket_name" \
+                --log="$dpdwr_weston_log" \
+            >"$dpdwr_launch_log" 2>&1 &
+
+    dpdwr_pid=$!
+    dpdwr_started=1
+
+    while [ "$dpdwr_wait" -lt "$dpdwr_wait_secs" ]; do
+        if [ -S "$dpdwr_socket_path" ]; then
+            break
+        fi
+
+        if ! kill -0 "$dpdwr_pid" 2>/dev/null; then
+            break
+        fi
+
+        sleep 1
+        dpdwr_wait=$((dpdwr_wait + 1))
+    done
+
+    if [ ! -S "$dpdwr_socket_path" ]; then
+        log_error "Desktop Weston did not create its Wayland socket"
+        tail -n 80 "$dpdwr_weston_log" 2>/dev/null || true
+        tail -n 40 "$dpdwr_launch_log" 2>/dev/null || true
+
+        if [ "$dpdwr_started" -eq 1 ]; then
+            kill -TERM "$dpdwr_pid" 2>/dev/null || true
+            wait "$dpdwr_pid" 2>/dev/null || true
+        fi
+
+        if [ "$dpdwr_display_manager_stopped" -eq 1 ] &&
+           command -v display_restore_service_from_state >/dev/null 2>&1; then
+            display_restore_service_from_state "$dpdwr_state_file" || true
+        fi
+
+        return 1
+    fi
+
+    if ! command -v adopt_wayland_env_from_socket >/dev/null 2>&1 ||
+       ! adopt_wayland_env_from_socket "$dpdwr_socket_path"; then
+        log_error "Could not adopt the desktop Weston Wayland socket"
+        kill -TERM "$dpdwr_pid" 2>/dev/null || true
+        wait "$dpdwr_pid" 2>/dev/null || true
+
+        if [ "$dpdwr_display_manager_stopped" -eq 1 ] &&
+           command -v display_restore_service_from_state >/dev/null 2>&1; then
+            display_restore_service_from_state "$dpdwr_state_file" || true
+        fi
+
+        return 1
+    fi
+
+    if command -v wayland_connection_ok >/dev/null 2>&1 &&
+       ! wayland_connection_ok; then
+        log_error "Desktop Weston socket exists but the Wayland client probe failed"
+        kill -TERM "$dpdwr_pid" 2>/dev/null || true
+        wait "$dpdwr_pid" 2>/dev/null || true
+
+        if [ "$dpdwr_display_manager_stopped" -eq 1 ] &&
+           command -v display_restore_service_from_state >/dev/null 2>&1; then
+            display_restore_service_from_state "$dpdwr_state_file" || true
+        fi
+
+        return 1
+    fi
+
+    if [ -r "$dpdwr_weston_log" ] &&
+       tail -n 200 "$dpdwr_weston_log" 2>/dev/null |
+           grep -Eiq \
+               "atomic: couldn.t commit new state: Permission denied|repaint-flush failed: Permission denied|failed to acquire DRM master|failed to initialize DRM backend|failed to create renderer"; then
+        log_error "Desktop Weston reports fatal DRM/KMS errors"
+        tail -n 80 "$dpdwr_weston_log" 2>/dev/null || true
+        kill -TERM "$dpdwr_pid" 2>/dev/null || true
+        wait "$dpdwr_pid" 2>/dev/null || true
+
+        if [ "$dpdwr_display_manager_stopped" -eq 1 ] &&
+           command -v display_restore_service_from_state >/dev/null 2>&1; then
+            display_restore_service_from_state "$dpdwr_state_file" || true
+        fi
+
+        return 1
+    fi
+
+    DISPLAY_WAYLAND_SOCKET="$dpdwr_socket_path"
+    DISPLAY_DESKTOP_WESTON_PID="$dpdwr_pid"
+    DISPLAY_DESKTOP_WESTON_LOG="$dpdwr_weston_log"
+    DISPLAY_DESKTOP_WESTON_DRM_DEVICE="$dpdwr_drm_device"
+
+    export DISPLAY_WAYLAND_SOCKET
+    export DISPLAY_DESKTOP_WESTON_PID
+    export DISPLAY_DESKTOP_WESTON_LOG
+    export DISPLAY_DESKTOP_WESTON_DRM_DEVICE
+
+    log_pass "Desktop Weston runtime is ready, socket=$dpdwr_socket_path pid=$dpdwr_pid"
+    return 0
+}
+
+display_prepare_desktop_graphics_stack() {
+    dpdgs_testname="${1:-display-test}"
+    dpdgs_mode="${2:-auto}"
+    dpdgs_gpu_module="${3:-msm_kgsl}"
+    dpdgs_gpu_device="${4:-/dev/kgsl-3d0}"
+    dpdgs_gbm_package="${5:-libgbm-msm1}"
+    dpdgs_rc=0
+    dpdgs_package_changed=0
+    dpdgs_boot_changed=0
+
+    case "$dpdgs_mode" in
+        auto)
+            log_info "Desktop graphics mode is auto, preserving the currently installed and booted stack"
+            return 0
+            ;;
+
+        overlay)
+            for dpdgs_helper in \
+                pkg_package_set_contains \
+                pkg_ensure_optional_package_set_present \
+                pkg_package_has_file_matching \
+                mrv_qcom_gpu_validate_boot_mode \
+                display_select_egl_vendor; do
+                if ! command -v "$dpdgs_helper" >/dev/null 2>&1; then
+                    log_fail "$dpdgs_testname FAIL - required desktop overlay helper is unavailable: $dpdgs_helper"
+                    return 1
+                fi
+            done
+
+            if ! pkg_package_set_contains graphics "$dpdgs_gbm_package"; then
+                log_fail "$dpdgs_testname FAIL - graphics package set is incomplete, missing $dpdgs_gbm_package"
+                return 1
+            fi
+
+            if ! pkg_ensure_optional_package_set_present \
+                graphics \
+                qli-staging \
+                auto \
+                --overlay; then
+                log_fail "$dpdgs_testname FAIL - failed to ensure Qualcomm graphics overlay package set"
+                return 1
+            fi
+
+            if ! pkg_package_has_file_matching \
+                "$dpdgs_gbm_package" \
+                '/gbm/msm_gbm[.]so$'; then
+                log_fail "$dpdgs_testname FAIL - Qualcomm GBM backend is unavailable from $dpdgs_gbm_package"
+                return 1
+            fi
+
+            mrv_qcom_gpu_validate_boot_mode \
+                kgsl \
+                "$dpdgs_gpu_module" \
+                "$dpdgs_gpu_device" \
+                msm
+            dpdgs_rc=$?
+
+            case "$dpdgs_rc" in
+                0)
+                    ;;
+                2)
+                    log_skip "$dpdgs_testname SKIP - Qualcomm overlay packages are ready, reboot required to activate KGSL"
+                    return 2
+                    ;;
+                *)
+                    log_skip "$dpdgs_testname SKIP - unable to confirm a valid KGSL boot runtime"
+                    return 2
+                    ;;
+            esac
+
+            if command -v ldconfig >/dev/null 2>&1 && ! ldconfig; then
+                log_fail "$dpdgs_testname FAIL - ldconfig failed after overlay package validation"
+                return 1
+            fi
+
+            if ! display_select_egl_vendor adreno; then
+                log_fail "$dpdgs_testname FAIL - failed to select Qualcomm Adreno EGL vendor"
+                return 1
+            fi
+
+            log_pass "Qualcomm overlay packages, GBM backend, and KGSL boot runtime are ready"
+            return 0
+            ;;
+
+        base)
+            for dpdgs_helper in \
+                pkg_restore_package_set \
+                pkg_ensure_required_package_set_present \
+                mrv_qcom_gpu_cleanup_kgsl_boot_artifacts \
+                mrv_qcom_gpu_validate_boot_mode \
+                display_select_egl_vendor; do
+                if ! command -v "$dpdgs_helper" >/dev/null 2>&1; then
+                    log_fail "$dpdgs_testname FAIL - required desktop base helper is unavailable: $dpdgs_helper"
+                    return 1
+                fi
+            done
+
+            dpdgs_package_changed=0
+            dpdgs_boot_changed=0
+
+            pkg_restore_package_set graphics
+            dpdgs_rc=$?
+
+            case "$dpdgs_rc" in
+                0)
+                    dpdgs_package_changed=0
+                    ;;
+                2)
+                    dpdgs_package_changed=1
+                    ;;
+                *)
+                    log_fail "$dpdgs_testname FAIL - failed to remove Qualcomm graphics overlay package set"
+                    return 1
+                    ;;
+            esac
+
+            mrv_qcom_gpu_cleanup_kgsl_boot_artifacts
+            dpdgs_rc=$?
+
+            case "$dpdgs_rc" in
+                0)
+                    dpdgs_boot_changed=1
+                    ;;
+                1)
+                    dpdgs_boot_changed=0
+                    ;;
+                2)
+                    log_fail "$dpdgs_testname FAIL - failed to clean stale KGSL boot artifacts"
+                    return 1
+                    ;;
+                *)
+                    log_fail "$dpdgs_testname FAIL - unexpected KGSL boot-artifact cleanup result, rc=$dpdgs_rc"
+                    return 1
+                    ;;
+            esac
+
+            if ! pkg_ensure_required_package_set_present graphics-base; then
+                log_fail "$dpdgs_testname FAIL - failed to ensure upstream Mesa graphics package set"
+                return 1
+            fi
+
+            if [ "$dpdgs_package_changed" -eq 1 ] ||
+               [ "$dpdgs_boot_changed" -eq 1 ]; then
+                    log_skip "$dpdgs_testname SKIP - Qualcomm graphics packages or KGSL boot artifacts changed, reboot required to activate upstream MSM/freedreno"
+                return 2
+            fi
+
+            mrv_qcom_gpu_validate_boot_mode \
+                msm \
+                "$dpdgs_gpu_module" \
+                "$dpdgs_gpu_device" \
+                msm
+            dpdgs_rc=$?
+
+            case "$dpdgs_rc" in
+                0)
+                    ;;
+                2)
+                    log_skip "$dpdgs_testname SKIP - current boot still uses KGSL, reboot required to restore upstream MSM/freedreno ownership"
+                    return 2
+                    ;;
+                *)
+                    log_skip "$dpdgs_testname SKIP - unable to confirm upstream MSM/freedreno ownership"
+                    return 2
+                    ;;
+            esac
+
+            if ! display_select_egl_vendor mesa; then
+                log_skip "$dpdgs_testname SKIP - Mesa EGL vendor is unavailable"
+                return 2
+            fi
+
+            log_pass "Upstream MSM/freedreno packages and boot runtime are ready"
+            return 0
+            ;;
+
+        *)
+            log_fail "$dpdgs_testname FAIL - unsupported desktop graphics mode: $dpdgs_mode"
+            return 1
+            ;;
+    esac
+}
+
+display_prepare_image_weston_runtime() {
+    dpiwr_testname="${1:-display-test}"
+    dpiwr_wait_secs="${2:-10}"
+    dpiwr_flavour="${3:-base}"
+    dpiwr_sock=""
+    dpiwr_new_sock=""
+
+    log_info "Preserving image-provided Weston runtime behavior"
+
+    if command -v wayland_debug_snapshot >/dev/null 2>&1; then
+        wayland_debug_snapshot "${dpiwr_testname}: start"
+    fi
+
+    if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+        dpiwr_sock="$(
+            discover_wayland_socket_anywhere 2>/dev/null |
+                head -n 1 ||
+                true
+        )"
+    fi
+
+    if [ -n "$dpiwr_sock" ] &&
+       command -v adopt_wayland_env_from_socket >/dev/null 2>&1; then
+        log_info "Found existing Wayland socket, $dpiwr_sock"
+
+        if ! adopt_wayland_env_from_socket "$dpiwr_sock"; then
+            log_warn "Failed to adopt Wayland environment from $dpiwr_sock"
+        fi
+    fi
+
+    if [ -z "$dpiwr_sock" ] &&
+       [ "$dpiwr_flavour" = "base" ] &&
+       command -v weston_wait_ready >/dev/null 2>&1; then
+        log_info "No usable Wayland socket yet on base build, waiting briefly for the image-provided Weston runtime"
+
+        if weston_wait_ready "$dpiwr_wait_secs"; then
+            if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+                dpiwr_sock="$(
+                    discover_wayland_socket_anywhere 2>/dev/null |
+                        head -n 1 ||
+                        true
+                )"
+            fi
+
+            if [ -n "$dpiwr_sock" ] &&
+               command -v adopt_wayland_env_from_socket >/dev/null 2>&1; then
+                log_info "Base Weston runtime became ready, $dpiwr_sock"
+                adopt_wayland_env_from_socket "$dpiwr_sock" || true
+            fi
+        fi
+    fi
+
+    if [ -z "$dpiwr_sock" ]; then
+        if [ "$dpiwr_flavour" = "overlay" ] &&
+           command -v overlay_start_weston_drm >/dev/null 2>&1; then
+            log_info "No usable Wayland socket, starting overlay Weston through overlay_start_weston_drm"
+
+            if command -v \
+                weston_force_primary_1080p60_if_not_60 \
+                >/dev/null 2>&1; then
+                log_info "Pre-configuring the primary output to about 60Hz before starting Weston, best effort"
+                weston_force_primary_1080p60_if_not_60 || true
+            fi
+
+            if ! overlay_start_weston_drm; then
+                log_warn "overlay_start_weston_drm returned non-zero"
+                return 1
+            fi
+
+            if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+                dpiwr_sock="$(
+                    discover_wayland_socket_anywhere 2>/dev/null |
+                        head -n 1 ||
+                        true
+                )"
+            fi
+
+            if [ -n "$dpiwr_sock" ] &&
+               command -v adopt_wayland_env_from_socket >/dev/null 2>&1; then
+                log_info "Overlay Weston created Wayland socket, $dpiwr_sock"
+                adopt_wayland_env_from_socket "$dpiwr_sock" || true
+            else
+                log_warn "overlay_start_weston_drm reported success but no Wayland socket was found"
+            fi
+        else
+            log_fail "$dpiwr_testname FAIL - no image-provided Wayland socket is available"
+            return 1
+        fi
+    fi
+
+    if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+        dpiwr_new_sock="$(
+            discover_wayland_socket_anywhere 2>/dev/null |
+                head -n 1 ||
+                true
+        )"
+
+        if [ -n "$dpiwr_new_sock" ]; then
+            dpiwr_sock="$dpiwr_new_sock"
+        fi
+    fi
+
+    if [ -z "$dpiwr_sock" ]; then
+        log_fail "$dpiwr_testname FAIL - no Wayland socket was found after runtime preparation"
+        return 1
+    fi
+
+    if command -v adopt_wayland_env_from_socket >/dev/null 2>&1; then
+        if ! adopt_wayland_env_from_socket "$dpiwr_sock"; then
+            log_fail "$dpiwr_testname FAIL - failed to adopt the final Wayland socket"
+            return 1
+        fi
+    else
+        XDG_RUNTIME_DIR="$(dirname "$dpiwr_sock")"
+        WAYLAND_DISPLAY="$(basename "$dpiwr_sock")"
+        export XDG_RUNTIME_DIR
+        export WAYLAND_DISPLAY
+    fi
+
+    if command -v wayland_connection_ok >/dev/null 2>&1; then
+        if ! wayland_connection_ok; then
+            if [ "$dpiwr_flavour" = "base" ] &&
+               command -v weston_wait_ready >/dev/null 2>&1; then
+                log_warn "Initial Wayland connection test failed, waiting briefly and retrying"
+
+                if weston_wait_ready 5; then
+                    if command -v discover_wayland_socket_anywhere >/dev/null 2>&1; then
+                        dpiwr_sock="$(
+                            discover_wayland_socket_anywhere 2>/dev/null |
+                                head -n 1 ||
+                                true
+                        )"
+                    fi
+
+                    if [ -n "$dpiwr_sock" ] &&
+                       command -v adopt_wayland_env_from_socket >/dev/null 2>&1; then
+                        adopt_wayland_env_from_socket "$dpiwr_sock" || true
+                    fi
+                fi
+            fi
+
+            if ! wayland_connection_ok; then
+                log_fail "$dpiwr_testname FAIL - Wayland connection test failed"
+                return 1
+            fi
+        fi
+
+        log_info "Wayland connection test, OK"
+    else
+        log_warn "wayland_connection_ok helper is unavailable, continuing with socket validation only"
+    fi
+
+    DISPLAY_WAYLAND_SOCKET="$dpiwr_sock"
+
+    case "$dpiwr_sock" in
+        /run/user/*/wayland-*)
+            DISPLAY_RUNTIME_MODEL="per-user"
+            ;;
+        /run/wayland-*)
+            DISPLAY_RUNTIME_MODEL="global"
+            ;;
+        *)
+            DISPLAY_RUNTIME_MODEL="custom"
+            ;;
+    esac
+
+    export DISPLAY_WAYLAND_SOCKET
+    export DISPLAY_RUNTIME_MODEL
+
+    log_info "Wayland runtime model, $DISPLAY_RUNTIME_MODEL"
+    log_info "Wayland socket, $DISPLAY_WAYLAND_SOCKET"
+    log_info "XDG_RUNTIME_DIR, ${XDG_RUNTIME_DIR:-<unset>}"
+    log_info "WAYLAND_DISPLAY, ${WAYLAND_DISPLAY:-<unset>}"
+
+    return 0
+}
+
+display_resolve_test_fps_gate_policy() {
+    drtfgp_os_id="${1:-unknown}"
+    drtfgp_mode="${2:-auto}"
+    drtfgp_explicit="${3:-}"
+    drtfgp_cap="${4:-60}"
+    drtfgp_min_pct="${5:-85}"
+
+    DISPLAY_TEST_FPS_POLICY="shared"
+    DISPLAY_TEST_FPS_REFRESH="${DISPLAY_FPS_DETECTED_HZ:-}"
+    DISPLAY_TEST_FPS_EXPECTED="${DISPLAY_FPS_EXPECTED:-}"
+    DISPLAY_TEST_FPS_MIN_OK="${DISPLAY_FPS_MIN_OK:-}"
+
+    case "$drtfgp_os_id" in
+        debian|ubuntu|centos|rhel|fedora)
+            if [ "$drtfgp_mode" = "auto" ] &&
+               [ -z "$drtfgp_explicit" ]; then
+                DISPLAY_TEST_FPS_POLICY="desktop-functional-cap"
+                DISPLAY_TEST_FPS_EXPECTED="$drtfgp_cap"
+
+                case "$DISPLAY_TEST_FPS_REFRESH" in
+                    ''|*[!0-9]*)
+                        ;;
+                    *)
+                        if [ "$DISPLAY_TEST_FPS_REFRESH" -gt 0 ] &&
+                           [ "$DISPLAY_TEST_FPS_REFRESH" -lt "$DISPLAY_TEST_FPS_EXPECTED" ]; then
+                            DISPLAY_TEST_FPS_EXPECTED="$DISPLAY_TEST_FPS_REFRESH"
+                        fi
+                        ;;
+                esac
+
+                DISPLAY_TEST_FPS_MIN_OK=$((
+                    DISPLAY_TEST_FPS_EXPECTED * drtfgp_min_pct / 100
+                ))
+
+                if [ "$DISPLAY_TEST_FPS_MIN_OK" -le 0 ]; then
+                    DISPLAY_TEST_FPS_MIN_OK=1
+                fi
+            fi
+            ;;
+    esac
+
+    export DISPLAY_TEST_FPS_POLICY
+    export DISPLAY_TEST_FPS_REFRESH
+    export DISPLAY_TEST_FPS_EXPECTED
+    export DISPLAY_TEST_FPS_MIN_OK
+
+    return 0
+}
+
+display_apply_test_fps_gate_policy() {
+    datfgp_avg="${1:--}"
+    datfgp_count="${2:-0}"
+    datfgp_require="${3:-1}"
+
+    case "$datfgp_count" in
+        ''|*[!0-9]*)
+            datfgp_count=0
+            ;;
+    esac
+
+    if [ "${DISPLAY_TEST_FPS_POLICY:-shared}" != "desktop-functional-cap" ]; then
+        if command -v display_fps_gate_avg >/dev/null 2>&1; then
+            display_fps_gate_avg "$datfgp_avg" "$datfgp_count"
+            return $?
+        fi
+
+        if [ "$datfgp_require" -ne 0 ]; then
+            log_fail "FPS gating is required but display_fps_gate_avg is unavailable"
+            return 1
+        fi
+
+        log_warn "display_fps_gate_avg is unavailable, FPS gating was not requested"
+        return 0
+    fi
+
+    if [ "$datfgp_count" -eq 0 ]; then
+        if [ "$datfgp_require" -ne 0 ]; then
+            log_fail "Desktop functional FPS gate enabled but no FPS samples were found"
+            return 1
+        fi
+
+        log_warn "No FPS samples were found, FPS gating was not requested"
+        return 0
+    fi
+
+    if ! printf '%s\n' "$datfgp_avg" |
+        awk -v min="${DISPLAY_TEST_FPS_MIN_OK:-1}" '
+            $1 ~ /^[0-9]+([.][0-9]+)?$/ && ($1 + 0.0) >= (min + 0.0) {
+                exit 0
+            }
+            { exit 1 }
+        '; then
+        datfgp_rounded="$(
+            awk -v value="$datfgp_avg" 'BEGIN { printf "%.0f", value + 0.0 }'
+        )"
+
+        log_fail "Average FPS below desktop functional threshold, avg=$datfgp_avg (~$datfgp_rounded) < ${DISPLAY_TEST_FPS_MIN_OK:-1} (target=${DISPLAY_TEST_FPS_EXPECTED:-unknown}, output=${DISPLAY_TEST_FPS_REFRESH:-unknown}Hz)"
+        return 1
+    fi
+
+    datfgp_rounded="$(
+        awk -v value="$datfgp_avg" 'BEGIN { printf "%.0f", value + 0.0 }'
+    )"
+
+    log_info "Desktop functional FPS gate passed, avg=$datfgp_avg (~$datfgp_rounded) >= ${DISPLAY_TEST_FPS_MIN_OK:-1} (target=${DISPLAY_TEST_FPS_EXPECTED:-unknown}, output=${DISPLAY_TEST_FPS_REFRESH:-unknown}Hz)"
+    return 0
 }
 
