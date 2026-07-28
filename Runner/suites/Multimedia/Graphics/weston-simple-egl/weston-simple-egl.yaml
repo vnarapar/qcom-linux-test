@@ -1,15 +1,20 @@
 metadata:
   name: weston-simple-egl
   format: "Lava-Test Test Definition 1.0"
-  description: "Graphics scripts automates the validation of Graphics OpenGL ES 2.0 capabilities on the Qualcomm RB3 Gen2 platform running a Yocto-based Linux system. It utilizes Weston-Simple-EGL test app which is publicly available at https://github.com/krh/weston"
+  description: "Validate the Weston EGL client, renderer path, and synchronized FPS output."
   os:
     - linux
   scope:
     - functional
 
+params:
+  DURATION: "30s"
+  WAIT_SECS: "10"
+  REQUIRE_FPS: "1"
+
 run:
   steps:
     - REPO_PATH=$PWD
     - cd Runner/suites/Multimedia/Graphics/weston-simple-egl
-    - ./run.sh || true
+    - DURATION="${DURATION}" WAIT_SECS="${WAIT_SECS}" REQUIRE_FPS="${REQUIRE_FPS}" ./run.sh || true
     - $REPO_PATH/Runner/utils/send-to-lava.sh weston-simple-egl.res || true
