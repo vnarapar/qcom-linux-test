@@ -31,11 +31,13 @@ jobs:
           echo "tag_name=$TAG" >> $GITHUB_OUTPUT
 
       - name: Create .tar.zst archive
+        env:
+          TAG_NAME: ${{ steps.version.outputs.tag_name }}  # ✅ safe: env var, not inline expansion
         run: |
           git archive --format=tar \
             --prefix=qcom-linux-testkit/ \
-            "${{ steps.version.outputs.tag_name }}" \
-          | zstd -o "${GITHUB_WORKSPACE}/${{ steps.version.outputs.tag_name }}.tar.zst"
+            "$TAG_NAME" \
+            | zstd -o "${GITHUB_WORKSPACE}/${TAG_NAME}.tar.zst"
 
       - name: Create GitHub Release
         id: create_release
