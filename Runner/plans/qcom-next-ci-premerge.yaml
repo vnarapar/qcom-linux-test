@@ -83,5 +83,5 @@ run:
         - $PWD/suites/Multimedia/OpenCV/run.sh --build-dir . --cwd . --suite all --list 0 --shuffle 0 || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/OpenCV/OpenCV.res || true
         - $PWD/suites/Multimedia/Audio/Audio_Card_Registration/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Audio/Audio_Card_Registration/OpenCV.res || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Multimedia/Audio/Audio_Card_Registration/Audio_Card_Registration.res || true
         - $PWD/utils/result_parse.sh
