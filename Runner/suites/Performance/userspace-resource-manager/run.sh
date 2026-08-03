@@ -27,6 +27,7 @@ if [ -z "${__INIT_ENV_LOADED:-}" ]; then
     . "$INIT_ENV"
     __INIT_ENV_LOADED=1
 fi
+
 # shellcheck disable=SC1090,SC1091
 . "$TOOLS/functestlib.sh"
 
@@ -42,6 +43,13 @@ TESTNAME="userspace-resource-manager"
 test_path="$(find_test_case_by_name "$TESTNAME")"
 cd "$test_path" || exit 1
 RES_FILE="./${TESTNAME}.res"
+
+# Optional generic package-set recovery.
+# This must be a clean no-op when no package-set mapping exists for the active OS/provider.
+if [ -f "$TOOLS/lib_pkg_provider.sh" ]; then
+    # shellcheck disable=SC1091
+    . "$TOOLS/lib_pkg_provider.sh"
+fi
 
 log_info "=== Checking Dependencies ==="
 if ! check_dependencies awk grep pgrep date printf; then
@@ -133,7 +141,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-# ---------- Helpers ----------
+# ---------- Whitelist helpers (needed before package recovery) ----------
 approved_tests() {
     printf '%s\n' "$APPROVED_TESTS" | awk 'NF'
 }
@@ -150,6 +158,46 @@ is_approved() {
     done
     return 1
 }
+
+# ---------- Ensure packages ----------
+# Run only when at least one approved test will actually execute:
+#   --all              => always recover
+#   --bin NAME         => recover only when NAME is non-empty and approved
+# This prevents a typo or missing --bin value from triggering network access,
+# package installation and post-install actions before the runner skips the
+# unapproved test.
+# Guard with command -v so the calls are safe even when lib_pkg_provider.sh
+# was not sourced or the OS/provider has no mapping.
+pkg_recovery_needed=0
+if [ "$RUN_MODE" = "all" ]; then
+    pkg_recovery_needed=1
+elif [ "$RUN_MODE" = "one" ]; then
+    if [ -n "$ONE_BIN" ] && is_approved "$ONE_BIN"; then
+        pkg_recovery_needed=1
+    else
+        log_error "[PKG] --bin value '${ONE_BIN}' is not in the approved set; aborting"
+        echo "$TESTNAME FAIL" >"$RES_FILE"
+        exit 1
+    fi
+fi
+if [ "$pkg_recovery_needed" -eq 1 ]; then
+    if command -v pkg_lookup_package_set >/dev/null 2>&1 && \
+       command -v pkg_ensure_required_package_set_present >/dev/null 2>&1; then
+        if pkg_lookup_package_set urm >/dev/null 2>&1; then
+            if ! pkg_ensure_required_package_set_present urm; then
+                log_skip "$TESTNAME SKIP - failed to ensure required package set: urm"
+                echo "$TESTNAME SKIP" >"$RES_FILE"
+                exit 0
+            fi
+        else
+            log_info "No URM package-set mapping for this OS/provider; using image-provided assets"
+        fi
+    else
+        log_info "pkg_lookup_package_set / pkg_ensure_required_package_set_present not available; using image-provided assets"
+    fi
+fi
+
+# ---------- Helpers ----------
 suite_requires_base_cfgs() {
     name="$1"
     for s in $SUITES_REQUIRE_BASE_CFGS; do
