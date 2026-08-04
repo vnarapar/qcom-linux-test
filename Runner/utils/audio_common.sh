@@ -1262,67 +1262,87 @@ audio_parse_secs() {
   esac
 }
 
-# --- Local watchdog that always honors the first argument (e.g. "15" or "15s") ---
+# Run a command with a bounded timeout.
+#
+# Return:
+# child status - command exited before the timeout
+# 124 - timeout expired and the child was terminated
 audio_exec_with_timeout() {
-  dur="$1"; shift
- 
-  # normalize: allow "15" or "15s"
-  case "$dur" in
-    ""|"0") dur_norm=0 ;;
-    *s) dur_norm="${dur%s}" ;;
-    *) dur_norm="$dur" ;;
+  aewt_dur="${1:-0}"
+  shift
+
+  case "$aewt_dur" in
+    ""|0)
+      aewt_dur_norm=0
+      ;;
+    *s)
+      aewt_dur_norm=${aewt_dur%s}
+      ;;
+    *)
+      aewt_dur_norm=$aewt_dur
+      ;;
   esac
-  case "$dur_norm" in *[!0-9]*|"") dur_norm=0 ;; esac
- 
-  # no watchdog
-  if [ "$dur_norm" -le 0 ] 2>/dev/null; then
+
+  case "$aewt_dur_norm" in
+    ""|*[!0-9]*)
+      aewt_dur_norm=0
+      ;;
+  esac
+
+  if [ "$aewt_dur_norm" -le 0 ] 2>/dev/null; then
     "$@"
     return $?
   fi
- 
-  # Run in background and enforce our own bounded timeout (don't rely on external timeout)
+
   "$@" &
-  pid=$!
- 
-  start="$(date +%s 2>/dev/null || echo 0)"
-  deadline=$((start + dur_norm))
- 
-  # Wait until exit or deadline
-  while kill -0 "$pid" 2>/dev/null; do
-    now="$(date +%s 2>/dev/null || echo 0)"
-    if [ "$now" -ge "$deadline" ] 2>/dev/null; then
+  aewt_pid=$!
+
+  aewt_start="$(
+    date +%s 2>/dev/null ||
+      echo 0
+  )"
+
+  aewt_deadline=$((aewt_start + aewt_dur_norm))
+  aewt_timed_out=0
+
+  while kill -0 "$aewt_pid" 2>/dev/null; do
+    aewt_now="$(
+      date +%s 2>/dev/null ||
+        echo 0
+    )"
+
+    if [ "$aewt_now" -ge "$aewt_deadline" ] 2>/dev/null; then
+      aewt_timed_out=1
       break
     fi
+
     sleep 1
   done
- 
-  # Timed out: try terminate/kill, but never block forever
-  if kill -0 "$pid" 2>/dev/null; then
-    kill -TERM "$pid" 2>/dev/null || true
-    sleep 1
-    kill -KILL "$pid" 2>/dev/null || true
- 
-    # bounded grace wait (handles normal killable cases)
-    grace=0
-    while kill -0 "$pid" 2>/dev/null && [ "$grace" -lt 3 ]; do
-      sleep 1
-      grace=$((grace + 1))
-    done
- 
-    # Still alive -> likely D-state. Do NOT wait forever.
-    if kill -0 "$pid" 2>/dev/null; then
-      return 124
-    fi
- 
-    wait "$pid" 2>/dev/null
-    rc=$?
-    [ "$rc" -eq 143 ] 2>/dev/null && rc=124
-    return "$rc"
+
+  if [ "$aewt_timed_out" -eq 0 ]; then
+    wait "$aewt_pid"
+    return $?
   fi
- 
-  # Exited naturally before timeout
-  wait "$pid" 2>/dev/null
-  return $?
+
+  kill -TERM "$aewt_pid" 2>/dev/null || true
+
+  aewt_grace=0
+
+  while kill -0 "$aewt_pid" 2>/dev/null &&
+        [ "$aewt_grace" -lt 3 ]; do
+    sleep 1
+    aewt_grace=$((aewt_grace + 1))
+  done
+
+  if kill -0 "$aewt_pid" 2>/dev/null; then
+    kill -KILL "$aewt_pid" 2>/dev/null || true
+  fi
+
+  wait "$aewt_pid" 2>/dev/null || true
+
+  # The timeout itself is the authoritative status. Do not return pw-record's
+  # implementation-specific SIGTERM status, which can be 1 despite a valid WAV.
+  return 124
 }
 
 # Wait until the requested audio backend becomes usable.

@@ -1083,9 +1083,23 @@ if [ "$USE_CONFIG_DISCOVERY" = "true" ]; then
         rc=$?
         bytes="$(audio_record_capture_size)"
 
-        # If pw-record failed AND PipeWire control-plane is broken, restart/bootstrap and retry once
-        if [ "$rc" -ne 0 ] &&
-           ! audio_run_helper_as_test_user --require-session audio_pw_ctl_ok 2>/dev/null; then
+        # Restart/bootstrap only for an unexpected pw-record failure when the
+        # PipeWire control plane is also unresponsive. Watchdog termination is
+        # expected and must proceed to WAV validation without restarting.
+        record_command_failed=0
+
+        case "$rc" in
+          0|124|137|143)
+            ;;
+          *)
+            record_command_failed=1
+            ;;
+        esac
+
+        if [ "$record_command_failed" -eq 1 ] &&
+           ! audio_run_helper_as_test_user \
+               --require-session \
+               audio_pw_ctl_ok 2>/dev/null; then
           if [ "$SYSTEMD_AVAILABLE" -eq 1 ] && [ "${AUDIO_SYSTEMD_MANAGED:-0}" -eq 1 ]; then
             log_warn "[$case_name] pw-record rc=$rc and wpctl not responsive - restarting and retrying once"
             audio_record_restart_backend_best_effort "$AUDIO_BACKEND" >/dev/null 2>&1 || true
@@ -1374,9 +1388,23 @@ else
         rc=$?
         bytes="$(audio_record_capture_size)"
 
-        # If pw-record failed AND PipeWire control-plane is broken, restart/bootstrap and retry once
-        if [ "$rc" -ne 0 ] &&
-           ! audio_run_helper_as_test_user --require-session audio_pw_ctl_ok 2>/dev/null; then
+        # Restart/bootstrap only for an unexpected pw-record failure when the
+        # PipeWire control plane is also unresponsive. Watchdog termination is
+        # expected and must proceed to WAV validation without restarting.
+        record_command_failed=0
+
+        case "$rc" in
+          0|124|137|143)
+            ;;
+          *)
+            record_command_failed=1
+            ;;
+        esac
+
+        if [ "$record_command_failed" -eq 1 ] &&
+           ! audio_run_helper_as_test_user \
+               --require-session \
+               audio_pw_ctl_ok 2>/dev/null; then
           if [ "$SYSTEMD_AVAILABLE" -eq 1 ] && [ "${AUDIO_SYSTEMD_MANAGED:-0}" -eq 1 ]; then
             log_warn "[$case_name] pw-record rc=$rc and wpctl not responsive - restarting and retrying once"
             audio_record_restart_backend_best_effort "$AUDIO_BACKEND" >/dev/null 2>&1 || true
