@@ -85,6 +85,12 @@ rm -f "$res_file"
 
 log_info "------------------------------------------------------------"
 log_info "Starting $TESTNAME Testcase"
+if ! bt_prepare_ubuntu_stack; then
+    log_fail "$TESTNAME FAIL - Ubuntu Bluetooth stack preparation failed"
+    echo "$TESTNAME FAIL" > "$res_file"
+    exit 0
+fi
+
 log_info "Checking dependencies: bluetoothctl pgrep"
 
 if ! check_dependencies bluetoothctl pgrep; then

@@ -121,6 +121,12 @@ rm -f "$res_file"
 log_info "------------------------------------------------------------"
 log_info "Starting $TESTNAME Testcase"
 log_info "Config: BT_POWER_CYCLE_DELAY=${BT_POWER_CYCLE_DELAY}s BT_POWER_ON_ATTEMPTS=$BT_POWER_ON_ATTEMPTS BT_POWER_ON_RETRY_DELAY=${BT_POWER_ON_RETRY_DELAY}s BT_RESTART_SERVICE_ON_RETRY=$BT_RESTART_SERVICE_ON_RETRY"
+if ! bt_prepare_ubuntu_stack; then
+    log_fail "$TESTNAME FAIL - Ubuntu Bluetooth stack preparation failed"
+    echo "$TESTNAME FAIL" > "$res_file"
+    exit 0
+fi
+
 log_info "Checking dependency: bluetoothctl"
 
 # Verify that all necessary dependencies are available.
