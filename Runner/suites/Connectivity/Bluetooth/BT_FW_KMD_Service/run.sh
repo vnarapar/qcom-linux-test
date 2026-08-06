@@ -72,6 +72,12 @@ inc_warn() { WARN_COUNT=$((WARN_COUNT + 1)); }
 log_info "------------------------------------------------------------"
 log_info "Starting $TESTNAME"
 
+if ! bt_prepare_ubuntu_stack; then
+    log_fail "$TESTNAME FAIL - Ubuntu Bluetooth stack preparation failed"
+    echo "$TESTNAME FAIL" > "$RES_FILE"
+    exit 0
+fi
+
 log_info "Checking dependencies: bluetoothctl hciconfig lsmod"
 if ! check_dependencies bluetoothctl hciconfig lsmod; then
     echo "$TESTNAME SKIP" > "$RES_FILE"

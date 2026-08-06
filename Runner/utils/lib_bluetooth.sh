@@ -6,6 +6,362 @@
 # . "$TOOLS/functestlib.sh"
 # . "$TOOLS/lib_bluetooth.sh"
 
+# Read one value from /etc/os-release.
+bt_os_release_value() {
+    bt_orv_key="$1"
+
+    [ -n "$bt_orv_key" ] || return 1
+    [ -r /etc/os-release ] || return 1
+
+    sed -n "s/^${bt_orv_key}=//p" /etc/os-release 2>/dev/null |
+        sed -n '1p' |
+        sed 's/^"//;s/"$//'
+}
+
+# Detect Ubuntu Server or Desktop.
+# Override with BT_UBUNTU_VARIANT=server|desktop.
+bt_detect_ubuntu_variant() {
+    bt_duv_override="${BT_UBUNTU_VARIANT:-auto}"
+
+    case "$bt_duv_override" in
+        server|desktop)
+            printf '%s\n' "$bt_duv_override"
+            return 0
+            ;;
+        auto|"")
+            ;;
+        *)
+            log_warn "Invalid BT_UBUNTU_VARIANT=$bt_duv_override; using auto detection" >&2
+            ;;
+    esac
+
+    bt_duv_variant_id="$(
+        bt_os_release_value VARIANT_ID 2>/dev/null |
+            tr '[:upper:]' '[:lower:]'
+    )"
+
+    case "$bt_duv_variant_id" in
+        *desktop*)
+            printf '%s\n' "desktop"
+            return 0
+            ;;
+        *server*|minimal|core)
+            printf '%s\n' "server"
+            return 0
+            ;;
+    esac
+
+    if command -v dpkg-query >/dev/null 2>&1; then
+        for bt_duv_pkg in \
+            ubuntu-desktop \
+            ubuntu-desktop-minimal \
+            ubuntu-desktop-raspi
+        do
+            if dpkg-query -W -f='${Status}\n' "$bt_duv_pkg" 2>/dev/null |
+                grep -q '^install ok installed$'; then
+                printf '%s\n' "desktop"
+                return 0
+            fi
+        done
+
+        if dpkg-query -W -f='${Status}\n' ubuntu-server 2>/dev/null |
+            grep -q '^install ok installed$'; then
+            printf '%s\n' "server"
+            return 0
+        fi
+    fi
+
+    if [ -s /etc/X11/default-display-manager ]; then
+        printf '%s\n' "desktop"
+        return 0
+    fi
+
+    if command -v systemctl >/dev/null 2>&1 &&
+       systemctl is-active --quiet display-manager.service 2>/dev/null; then
+        printf '%s\n' "desktop"
+        return 0
+    fi
+
+    # Qualcomm Ubuntu Server images may not install the ubuntu-server
+    # meta-package. An Ubuntu image without desktop evidence is Server.
+    printf '%s\n' "server"
+    return 0
+}
+
+# Run systemctl --user for the prepared Ubuntu Bluetooth user.
+bt_ubuntu_user_systemctl() {
+    if [ -z "${BT_UBUNTU_USER:-}" ] ||
+       [ -z "${BT_UBUNTU_USER_UID:-}" ] ||
+       [ -z "${BT_UBUNTU_RUNTIME_DIR:-}" ]; then
+        log_fail "Ubuntu Bluetooth user manager has not been prepared"
+        return 1
+    fi
+
+    if [ "$(id -u 2>/dev/null || echo 1)" = "$BT_UBUNTU_USER_UID" ]; then
+        env \
+            HOME="$BT_UBUNTU_USER_HOME" \
+            USER="$BT_UBUNTU_USER" \
+            LOGNAME="$BT_UBUNTU_USER" \
+            XDG_RUNTIME_DIR="$BT_UBUNTU_RUNTIME_DIR" \
+            DBUS_SESSION_BUS_ADDRESS="$BT_UBUNTU_DBUS_ADDRESS" \
+            systemctl --user "$@"
+        return $?
+    fi
+
+    if command -v runuser >/dev/null 2>&1; then
+        runuser -u "$BT_UBUNTU_USER" -- \
+            env \
+                HOME="$BT_UBUNTU_USER_HOME" \
+                USER="$BT_UBUNTU_USER" \
+                LOGNAME="$BT_UBUNTU_USER" \
+                XDG_RUNTIME_DIR="$BT_UBUNTU_RUNTIME_DIR" \
+                DBUS_SESSION_BUS_ADDRESS="$BT_UBUNTU_DBUS_ADDRESS" \
+                systemctl --user "$@"
+        return $?
+    fi
+
+    log_fail "runuser is unavailable; cannot control $BT_UBUNTU_USER user services"
+    return 1
+}
+
+# Prepare the Ubuntu Bluetooth stack used by all current BT tests.
+# Debian, Yocto, and other distributions return immediately without changes.
+bt_prepare_ubuntu_stack() {
+    if command -v pkg_detect_os_id >/dev/null 2>&1; then
+        bt_pus_os_id="$(pkg_detect_os_id 2>/dev/null || echo unknown)"
+    else
+        bt_pus_os_id="$(
+            bt_os_release_value ID 2>/dev/null |
+                tr '[:upper:]' '[:lower:]'
+        )"
+    fi
+
+    if [ "$bt_pus_os_id" != "ubuntu" ]; then
+        return 0
+    fi
+
+    if [ "$(id -u 2>/dev/null || echo 1)" -ne 0 ]; then
+        log_fail "Ubuntu Bluetooth stack preparation must run as root"
+        return 1
+    fi
+
+    bt_pus_variant="$(bt_detect_ubuntu_variant)"
+
+    case "$bt_pus_variant" in
+        server|desktop)
+            ;;
+        *)
+            log_fail "Unable to determine Ubuntu Bluetooth variant"
+            return 1
+            ;;
+    esac
+
+    log_info "Ubuntu Bluetooth stack preparation: variant=$bt_pus_variant"
+
+    BT_UBUNTU_WIREPLUMBER_CONFIG_CHANGED=0
+    export BT_UBUNTU_WIREPLUMBER_CONFIG_CHANGED
+
+    if [ "$bt_pus_variant" = "server" ]; then
+        if ! command -v pkg_ensure_package_set >/dev/null 2>&1; then
+            if [ -n "${TOOLS:-}" ] &&
+               [ -r "$TOOLS/lib_pkg_provider.sh" ]; then
+                # shellcheck disable=SC1090,SC1091
+                . "$TOOLS/lib_pkg_provider.sh"
+            fi
+        fi
+
+        if ! command -v pkg_ensure_package_set >/dev/null 2>&1; then
+            log_fail "Bluetooth package-set helper is unavailable"
+            return 1
+        fi
+
+        if command -v pkg_ensure_required_package_set_present \
+            >/dev/null 2>&1; then
+            if ! pkg_ensure_required_package_set_present bluetooth; then
+                log_fail "Failed to prepare Ubuntu Server Bluetooth packages"
+                return 1
+            fi
+        elif ! pkg_ensure_package_set bluetooth; then
+            log_fail "Failed to prepare Ubuntu Server Bluetooth packages"
+            return 1
+        fi
+
+        bt_pus_wp_target="${BT_WIREPLUMBER_BLUETOOTH_CONF:-/usr/share/wireplumber/wireplumber.conf.d/50-bluetooth.conf}"
+        bt_pus_wp_dir="$(dirname "$bt_pus_wp_target")"
+        bt_pus_wp_tmp="${bt_pus_wp_target}.tmp.$$"
+
+        if ! mkdir -p "$bt_pus_wp_dir"; then
+            log_fail "Failed to create WirePlumber config directory: $bt_pus_wp_dir"
+            return 1
+        fi
+
+        cat >"$bt_pus_wp_tmp" <<'CONFIG_EOF'
+wireplumber.profiles = {
+  main = {
+    monitor.bluez = required
+    monitor.bluez-midi = optional
+    monitor.bluez.seat-monitoring = disabled
+  }
+}
+CONFIG_EOF
+
+        if [ -r "$bt_pus_wp_target" ] &&
+           cmp -s "$bt_pus_wp_tmp" "$bt_pus_wp_target"; then
+            rm -f "$bt_pus_wp_tmp"
+            log_pass "WirePlumber Bluetooth configuration is already present"
+        else
+            if ! chmod 0644 "$bt_pus_wp_tmp" ||
+               ! mv "$bt_pus_wp_tmp" "$bt_pus_wp_target"; then
+                rm -f "$bt_pus_wp_tmp"
+                log_fail "Failed to install WirePlumber Bluetooth configuration"
+                return 1
+            fi
+
+            BT_UBUNTU_WIREPLUMBER_CONFIG_CHANGED=1
+            export BT_UBUNTU_WIREPLUMBER_CONFIG_CHANGED
+
+            log_pass "Installed WirePlumber Bluetooth configuration: $bt_pus_wp_target"
+        fi
+    else
+        log_info "Ubuntu Desktop detected; package installation is not required"
+    fi
+
+    if ! command -v systemctl >/dev/null 2>&1; then
+        log_fail "systemctl is required for Ubuntu Bluetooth validation"
+        return 1
+    fi
+
+    if ! systemctl start bluetooth.service >/dev/null 2>&1; then
+        log_fail "Failed to start bluetooth.service"
+        systemctl status bluetooth.service --no-pager 2>/dev/null || true
+        return 1
+    fi
+
+    bt_pus_wait=0
+    while [ "$bt_pus_wait" -lt 20 ]; do
+        if systemctl is-active --quiet bluetooth.service; then
+            break
+        fi
+
+        sleep 1
+        bt_pus_wait=$((bt_pus_wait + 1))
+    done
+
+    if ! systemctl is-active --quiet bluetooth.service; then
+        log_fail "bluetooth.service is not active"
+        systemctl status bluetooth.service --no-pager 2>/dev/null || true
+        return 1
+    fi
+
+    log_pass "bluetooth.service is active"
+
+    BT_UBUNTU_USER="${BT_UBUNTU_USER:-qcom}"
+
+    if ! id "$BT_UBUNTU_USER" >/dev/null 2>&1; then
+        log_fail "Ubuntu Bluetooth test user does not exist: $BT_UBUNTU_USER"
+        return 1
+    fi
+
+    BT_UBUNTU_USER_UID="$(id -u "$BT_UBUNTU_USER" 2>/dev/null || true)"
+    BT_UBUNTU_USER_HOME="$(
+        getent passwd "$BT_UBUNTU_USER" 2>/dev/null |
+            awk -F: 'NR == 1 { print $6 }'
+    )"
+    [ -n "$BT_UBUNTU_USER_HOME" ] ||
+        BT_UBUNTU_USER_HOME="/home/$BT_UBUNTU_USER"
+
+    BT_UBUNTU_RUNTIME_DIR="/run/user/$BT_UBUNTU_USER_UID"
+    BT_UBUNTU_DBUS_ADDRESS="unix:path=$BT_UBUNTU_RUNTIME_DIR/bus"
+
+    export \
+        BT_UBUNTU_USER \
+        BT_UBUNTU_USER_UID \
+        BT_UBUNTU_USER_HOME \
+        BT_UBUNTU_RUNTIME_DIR \
+        BT_UBUNTU_DBUS_ADDRESS
+
+    if command -v loginctl >/dev/null 2>&1; then
+        loginctl enable-linger "$BT_UBUNTU_USER" >/dev/null 2>&1 || true
+    fi
+
+    systemctl start "user@${BT_UBUNTU_USER_UID}.service" >/dev/null 2>&1 || true
+
+    bt_pus_wait=0
+    while [ "$bt_pus_wait" -lt 15 ]; do
+        if [ -S "$BT_UBUNTU_RUNTIME_DIR/bus" ]; then
+            break
+        fi
+
+        sleep 1
+        bt_pus_wait=$((bt_pus_wait + 1))
+    done
+
+    if [ ! -S "$BT_UBUNTU_RUNTIME_DIR/bus" ]; then
+        log_fail "Ubuntu Bluetooth user bus is unavailable: $BT_UBUNTU_RUNTIME_DIR/bus"
+        return 1
+    fi
+
+    log_pass "Ubuntu Bluetooth user manager is ready: user=$BT_UBUNTU_USER uid=$BT_UBUNTU_USER_UID"
+
+    bt_pus_restart_user_services=0
+
+    if [ "$BT_UBUNTU_WIREPLUMBER_CONFIG_CHANGED" -eq 1 ]; then
+        bt_pus_restart_user_services=1
+    fi
+
+    if ! bt_ubuntu_user_systemctl \
+        is-active --quiet pipewire.service wireplumber.service; then
+        bt_pus_restart_user_services=1
+    fi
+
+    if [ "$bt_pus_restart_user_services" -eq 1 ]; then
+        log_info "Restarting PipeWire and WirePlumber for user=$BT_UBUNTU_USER"
+
+        if ! bt_ubuntu_user_systemctl \
+            restart pipewire.service wireplumber.service; then
+            log_fail "Failed to restart Ubuntu Bluetooth user services"
+            return 1
+        fi
+    fi
+
+    bt_pus_wait=0
+    while [ "$bt_pus_wait" -lt 20 ]; do
+        if bt_ubuntu_user_systemctl \
+            is-active --quiet pipewire.service wireplumber.service; then
+            break
+        fi
+
+        sleep 1
+        bt_pus_wait=$((bt_pus_wait + 1))
+    done
+
+    if ! bt_ubuntu_user_systemctl \
+        is-active --quiet pipewire.service wireplumber.service; then
+        log_fail "PipeWire and WirePlumber user services are not ready"
+        return 1
+    fi
+
+    log_pass "PipeWire and WirePlumber user services are active"
+
+    if [ ! -d /sys/module/bluetooth ] &&
+       ! grep -q '^bluetooth[[:space:]]' /proc/modules 2>/dev/null; then
+        if command -v modprobe >/dev/null 2>&1; then
+            log_info "Bluetooth kernel core is not active; attempting modprobe bluetooth"
+            modprobe bluetooth >/dev/null 2>&1 || true
+        fi
+    fi
+
+    if [ ! -d /sys/module/bluetooth ] &&
+       ! grep -q '^bluetooth[[:space:]]' /proc/modules 2>/dev/null; then
+        log_fail "Bluetooth kernel core is not present"
+        return 1
+    fi
+
+    log_pass "Bluetooth kernel core is present"
+    log_pass "Ubuntu Bluetooth stack is ready: variant=$bt_pus_variant"
+    return 0
+}
+
 bt_has_controller() {
 # Use plain bluetoothctl list here; the expect wrapper is overkill and
 # sometimes swallows the "Controller ..." line for pipelines.

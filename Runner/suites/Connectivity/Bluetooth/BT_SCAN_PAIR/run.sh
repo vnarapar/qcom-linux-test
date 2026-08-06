@@ -100,6 +100,12 @@ if [ -z "$BT_MAC" ] && [ -z "$BT_NAME" ] && [ ! -f "./bt_device_list.txt" ]; the
     exit 0
 fi
 
+if ! bt_prepare_ubuntu_stack; then
+    log_fail "$TESTNAME FAIL - Ubuntu Bluetooth stack preparation failed"
+    echo "$TESTNAME FAIL" > "$RES_FILE"
+    exit 0
+fi
+
 check_dependencies bluetoothctl rfkill expect hciconfig || {
     log_warn "Missing required tools; skipping $TESTNAME."
     echo "$TESTNAME SKIP" > "$RES_FILE"
