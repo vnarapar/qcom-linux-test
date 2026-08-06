@@ -1341,6 +1341,7 @@ pkg_apt_update() {
         env DEBIAN_FRONTEND=noninteractive \
         "$PKG_APT_GET" update \
         -o Acquire::Retries=2 \
+        -o Acquire::Languages=none \
         -o "DPkg::Lock::Timeout=${PKG_APT_LOCK_TIMEOUT}"
 
     apt_update_rc=$?
@@ -1530,6 +1531,86 @@ pkg_apt_install_package() {
                 --no-install-recommends \
                 -o "DPkg::Lock::Timeout=${PKG_APT_LOCK_TIMEOUT}" \
                 "$apt_install_pkg"
+        fi
+    fi
+}
+
+# Install multiple ordinary apt packages in one transaction.
+#
+# Args:
+#   $1     - command-label suffix, normally the package-set name
+#   $2..$N - package names
+#
+# DKMS packages must continue through pkg_apt_install_package() so their
+# header preflight, recommended build dependencies, and cleanup behavior are
+# preserved.
+pkg_apt_install_package_list() {
+    apt_list_label="$1"
+    shift
+
+    if [ "$#" -eq 0 ]; then
+        return 0
+    fi
+
+    for apt_list_pkg in "$@"; do
+        [ -n "$apt_list_pkg" ] || continue
+
+        if pkg_is_dkms_package "$apt_list_pkg"; then
+            pkg_log_fail "DKMS package cannot use batch apt installation, pkg=$apt_list_pkg"
+            return 1
+        fi
+    done
+
+    apt_list_packages="$*"
+
+    pkg_apt_update || return 1
+    pkg_apt_upgrade || return 1
+
+    pkg_apt_fix_broken_if_enabled || true
+
+    if command -v apt-cache >/dev/null 2>&1; then
+        for apt_list_pkg in "$@"; do
+            [ -n "$apt_list_pkg" ] || continue
+
+            apt-cache policy "$apt_list_pkg" 2>&1 |
+                sed "s/^/[APT-POLICY:$apt_list_pkg] /" ||
+                true
+        done
+    fi
+
+    pkg_log_info "Installing apt package list in one transaction, packages=$apt_list_packages"
+
+    if pkg_bool_true "$PKG_APT_INSTALL_RECOMMENDS"; then
+        if pkg_bool_true "$PKG_APT_FIX_MISSING"; then
+            pkg_run_cmd_retry "apt-install-package-set-$apt_list_label" \
+                env DEBIAN_FRONTEND=noninteractive \
+                "$PKG_APT_GET" install -y \
+                --fix-missing \
+                -o "DPkg::Lock::Timeout=${PKG_APT_LOCK_TIMEOUT}" \
+                "$@"
+        else
+            pkg_run_cmd_retry "apt-install-package-set-$apt_list_label" \
+                env DEBIAN_FRONTEND=noninteractive \
+                "$PKG_APT_GET" install -y \
+                -o "DPkg::Lock::Timeout=${PKG_APT_LOCK_TIMEOUT}" \
+                "$@"
+        fi
+    else
+        if pkg_bool_true "$PKG_APT_FIX_MISSING"; then
+            pkg_run_cmd_retry "apt-install-package-set-$apt_list_label" \
+                env DEBIAN_FRONTEND=noninteractive \
+                "$PKG_APT_GET" install -y \
+                --no-install-recommends \
+                --fix-missing \
+                -o "DPkg::Lock::Timeout=${PKG_APT_LOCK_TIMEOUT}" \
+                "$@"
+        else
+            pkg_run_cmd_retry "apt-install-package-set-$apt_list_label" \
+                env DEBIAN_FRONTEND=noninteractive \
+                "$PKG_APT_GET" install -y \
+                --no-install-recommends \
+                -o "DPkg::Lock::Timeout=${PKG_APT_LOCK_TIMEOUT}" \
+                "$@"
         fi
     fi
 }
@@ -1842,6 +1923,10 @@ pkg_ensure_or_upgrade_package() {
 }
 
 # Ensure every package in a named package set is installed or upgraded when mapped.
+#
+# APT package sets batch ordinary missing packages into one transaction.
+# DKMS packages retain their existing individual handling.
+# RPM, opkg, and check-only providers retain their existing behavior.
 pkg_ensure_package_set() {
     set_name="$1"
 
@@ -1861,14 +1946,93 @@ pkg_ensure_package_set() {
 
     pkg_log_info "Ensuring package set, set=$set_name packages=$set_packages"
 
-    for set_pkg in $set_packages; do
-        [ -n "$set_pkg" ] || continue
+    case "$set_provider" in
+        apt)
+            set_existing_packages=""
+            set_missing_packages=""
+            set_missing_dkms_packages=""
 
-        if ! pkg_ensure_or_upgrade_package "$set_pkg"; then
-            pkg_log_fail "Failed to ensure package set, set=$set_name pkg=$set_pkg"
-            return 1
-        fi
-    done
+            for set_pkg in $set_packages; do
+                [ -n "$set_pkg" ] || continue
+
+                if pkg_have_package "$set_pkg"; then
+                    set_existing_packages="${set_existing_packages}${set_existing_packages:+ }$set_pkg"
+                elif pkg_is_dkms_package "$set_pkg"; then
+                    set_missing_dkms_packages="${set_missing_dkms_packages}${set_missing_dkms_packages:+ }$set_pkg"
+                else
+                    set_missing_packages="${set_missing_packages}${set_missing_packages:+ }$set_pkg"
+                fi
+            done
+
+            if [ -n "$set_missing_packages" ]; then
+                if ! pkg_can_install; then
+                    pkg_log_fail "Package set is incomplete and installation is unavailable, set=$set_name missing=$set_missing_packages"
+                    return 1
+                fi
+
+                pkg_provider_summary
+
+                # Package names come from the trusted repository package map.
+                # shellcheck disable=SC2086
+                if ! pkg_apt_install_package_list \
+                    "$set_name" \
+                    $set_missing_packages; then
+                    pkg_log_warn "Batch package-set installation failed; falling back to individual recovery, set=$set_name"
+
+                    for set_pkg in $set_missing_packages; do
+                        [ -n "$set_pkg" ] || continue
+                        pkg_log_warn "Package missing, installing individually, $set_pkg"
+
+                        if ! pkg_ensure_package "$set_pkg"; then
+                            pkg_log_fail "Failed to ensure package set, set=$set_name pkg=$set_pkg"
+                            return 1
+                        fi
+                    done
+                fi
+
+                for set_pkg in $set_missing_packages; do
+                    [ -n "$set_pkg" ] || continue
+
+                    if ! pkg_have_package "$set_pkg"; then
+                        pkg_log_fail "Package remains missing after package-set installation, set=$set_name pkg=$set_pkg"
+                        return 1
+                    fi
+
+                    pkg_log_package_present "$set_pkg"
+                    pkg_log_package_dependencies "$set_pkg"
+                done
+            fi
+
+            for set_pkg in $set_missing_dkms_packages; do
+                [ -n "$set_pkg" ] || continue
+                pkg_log_warn "DKMS package missing, installing individually, $set_pkg"
+
+                if ! pkg_ensure_or_upgrade_package "$set_pkg"; then
+                    pkg_log_fail "Failed to ensure package set, set=$set_name pkg=$set_pkg"
+                    return 1
+                fi
+            done
+
+            for set_pkg in $set_existing_packages; do
+                [ -n "$set_pkg" ] || continue
+
+                if ! pkg_ensure_or_upgrade_package "$set_pkg"; then
+                    pkg_log_fail "Failed to ensure package set, set=$set_name pkg=$set_pkg"
+                    return 1
+                fi
+            done
+            ;;
+        *)
+            for set_pkg in $set_packages; do
+                [ -n "$set_pkg" ] || continue
+
+                if ! pkg_ensure_or_upgrade_package "$set_pkg"; then
+                    pkg_log_fail "Failed to ensure package set, set=$set_name pkg=$set_pkg"
+                    return 1
+                fi
+            done
+            ;;
+    esac
 
     pkg_log_pass "Package set ready, set=$set_name"
     return 0
