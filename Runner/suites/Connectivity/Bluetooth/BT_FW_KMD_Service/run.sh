@@ -98,18 +98,30 @@ else
 fi
 
 # ---------- DT node / compatible ----------
-# ---------- DT node / compatible ----------
+# M.2 E-key Bluetooth devices can be instantiated dynamically by pwrseq-pcie-m2,
+# so absence of a static qcom,wcn*-bt node is not a functional failure. Keep DT
+# discovery as topology evidence and let the runtime checks below own the verdict.
 if dt_confirm_node_or_compatible_all \
     "qcom,wcn3950-bt" \
     "qcom,wcn7850-bt" \
     "qcom,wcn6855-bt" \
     "qcom,wcn6750-bt" \
-    "qcom,bluetooth"
+    "qcom,bluetooth" \
+    "pcie-m2-e-connector"
 then
-    log_pass "DT node/compatible for BT present (at least one entry matched)."
+    log_pass "DT node/compatible for BT or an M.2 E-key connector is present."
 else
-    log_fail "DT node/compatible for BT NOT found."
-    inc_fail
+    dt_runtime_adapter=""
+    if command -v bt_select_usable_adapter >/dev/null 2>&1; then
+        dt_runtime_adapter="$(bt_select_usable_adapter 2>/dev/null || true)"
+    fi
+
+    if [ -n "$dt_runtime_adapter" ] && bt_adapter_is_usable "$dt_runtime_adapter"; then
+        log_warn "No static BT DT node or M.2 E-key connector found, operational HCI adapter $dt_runtime_adapter confirms runtime Bluetooth availability (GH#533)."
+    else
+        log_warn "No static BT DT node or M.2 E-key connector found, deferring the verdict to the authoritative KMD, HCI, service, firmware, and controller checks below (GH#533)."
+    fi
+    inc_warn
 fi
 
 # ---------- Firmware presence ----------
@@ -189,7 +201,7 @@ if command -v btfwloaded >/dev/null 2>&1; then
     esac
 else
     # No SKIP: continue test, just warn.
-    log_warn "btfwloaded() helper not available; firmware-load kernel-log validation not performed."
+    log_warn "btfwloaded() helper not available, firmware-load kernel-log validation not performed."
     inc_warn
 fi
 
