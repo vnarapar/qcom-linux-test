@@ -74,8 +74,6 @@ run:
         - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/WiFi/WiFi_Firmware_Driver/WiFi_Firmware_Driver.res || true
         - $PWD/suites/Connectivity/WiFi/WiFi_OnOff/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Connectivity/WiFi/WiFi_OnOff/WiFi_OnOff.res || true
-        - $PWD/suites/Kernel/Baseport/qcom_hwrng/run.sh || true
-        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/qcom_hwrng/qcom_hwrng.res || true
         - $PWD/suites/Kernel/Baseport/watchdog/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/watchdog/watchdog.res || true
         - $PWD/suites/Multimedia/DSP_AudioPD/run.sh || true
@@ -90,4 +88,6 @@ run:
         - $PWD/utils/send-to-lava.sh $PWD/suites/Virtualization/KVM/KVM_EL2_DTB/KVM_EL2_DTB.res || true
         - $PWD/suites/Virtualization/KVM/KVM_Infra/run.sh || true
         - $PWD/utils/send-to-lava.sh $PWD/suites/Virtualization/KVM/KVM_Infra/KVM_Infra.res || true
+        - $PWD/suites/Kernel/Baseport/qcom_hwrng/run.sh || true
+        - $PWD/utils/send-to-lava.sh $PWD/suites/Kernel/Baseport/qcom_hwrng/qcom_hwrng.res || true
         - $PWD/utils/result_parse.sh
