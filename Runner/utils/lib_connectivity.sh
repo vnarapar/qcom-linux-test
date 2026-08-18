@@ -261,8 +261,11 @@ wifi_has_probe_failures() {
     tag="${2:-wifi-probe-check}"
     include_regex="wifi|wlan|ath|cfg80211|mac80211|qca|wcn|firmware|mhi|pci|msi|qmi"
     exclude_regex="using dummy regulator|Loading compiled-in X.509 certificates for regulatory database"
+    failure_regex='(ath|wifi|wlan|qca|wcn).*(probe with driver .* failed|failed to alloc msi|qmi dma allocation failed|failed to create .*wlan|failed to register .*wlan|Direct firmware load .* failed|firmware.*failed|failed to load board data|failed to fetch board data|mhi.*failed)|(probe with driver .* failed|failed to alloc msi|qmi dma allocation failed|failed to create .*wlan|failed to register .*wlan|Direct firmware load .* failed|firmware.*failed|failed to load board data|failed to fetch board data|mhi.*failed).*(ath|wifi|wlan|qca|wcn)'
+    recoverable_dma_regex='qmi dma allocation failed.*will try later with small size'
     errfile=""
     failure_file=""
+    filtered_failure_file=""
     tmp_matches=""
     line=""
 
@@ -273,6 +276,7 @@ wifi_has_probe_failures() {
     mkdir -p "$outdir" >/dev/null 2>&1 || true
     errfile="$outdir/dmesg_errors.log"
     failure_file="$outdir/wifi_probe_failures.log"
+    filtered_failure_file="${failure_file}.filtered"
     : >"$failure_file"
 
     if command -v scan_dmesg_errors >/dev/null 2>&1; then
@@ -280,27 +284,46 @@ wifi_has_probe_failures() {
     fi
 
     if [ -s "$errfile" ]; then
-        grep -Ei \
-            '(ath|wifi|wlan|qca|wcn).*(probe with driver .* failed|failed to alloc msi|qmi dma allocation failed|failed to create .*wlan|failed to register .*wlan|Direct firmware load .* failed|firmware.*failed|failed to load board data|failed to fetch board data|mhi.*failed)|(probe with driver .* failed|failed to alloc msi|qmi dma allocation failed|failed to create .*wlan|failed to register .*wlan|Direct firmware load .* failed|firmware.*failed|failed to load board data|failed to fetch board data|mhi.*failed).*(ath|wifi|wlan|qca|wcn)' \
-            "$errfile" 2>/dev/null >>"$failure_file" || true
+        grep -Ei "$failure_regex" "$errfile" 2>/dev/null >>"$failure_file" || true
     fi
 
-    tmp_matches="$(get_kernel_log 2>/dev/null | grep -Ei \
-        '(ath|wifi|wlan|qca|wcn).*(probe with driver .* failed|failed to alloc msi|qmi dma allocation failed|failed to create .*wlan|failed to register .*wlan|Direct firmware load .* failed|firmware.*failed|failed to load board data|failed to fetch board data|mhi.*failed)|(probe with driver .* failed|failed to alloc msi|qmi dma allocation failed|failed to create .*wlan|failed to register .*wlan|Direct firmware load .* failed|firmware.*failed|failed to load board data|failed to fetch board data|mhi.*failed).*(ath|wifi|wlan|qca|wcn)' \
-        || true)"
+    tmp_matches="$(
+        get_kernel_log 2>/dev/null |
+            grep -Ei "$failure_regex" ||
+            true
+    )"
 
     if [ -n "$tmp_matches" ]; then
         printf '%s\n' "$tmp_matches" >>"$failure_file"
     fi
 
+    # ath12k can first request a large QMI DMA buffer and then explicitly
+    # retry with a smaller buffer. Treat that exact retry/fallback indication
+    # as informational; retain all other DMA allocation failures as failures.
+    if grep -Eiq "$recoverable_dma_regex" "$failure_file" 2>/dev/null; then
+        log_info "[$tag] Ignoring recoverable WiFi QMI DMA allocation fallback(s):"
+
+        grep -Ei "$recoverable_dma_regex" "$failure_file" 2>/dev/null |
+            awk '!seen[$0]++' |
+            while IFS= read -r line; do
+                [ -n "$line" ] || continue
+                log_info "[$tag] $line"
+            done
+    fi
+
+    grep -Eiv "$recoverable_dma_regex" "$failure_file" >"$filtered_failure_file" 2>/dev/null || true
+    mv "$filtered_failure_file" "$failure_file"
+
     if [ -s "$failure_file" ]; then
-        awk '!seen[$0]++' "$failure_file" >"${failure_file}.dedup" 2>/dev/null || cp "$failure_file" "${failure_file}.dedup" 2>/dev/null || true
+        awk '!seen[$0]++' "$failure_file" >"${failure_file}.dedup" 2>/dev/null ||
+            cp "$failure_file" "${failure_file}.dedup" 2>/dev/null ||
+            true
 
         log_fail "[$tag] matched WiFi probe/runtime failures:"
         while IFS= read -r line; do
             [ -n "$line" ] || continue
             log_fail "[$tag] $line"
-        done < "${failure_file}.dedup"
+        done <"${failure_file}.dedup"
 
         rm -f "${failure_file}.dedup"
         return 0
